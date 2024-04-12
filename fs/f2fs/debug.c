@@ -46,6 +46,7 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 	si->zombie_tree = atomic_read(&sbi->total_zombie_tree);
 	si->ext_node = atomic_read(&sbi->total_ext_node);
 	si->ndirty_node = get_pages(sbi, F2FS_DIRTY_NODES);
+	si->test_ndirty_node = get_pages(sbi, TEST_DIRTY_NODES);
 	si->ndirty_dent = get_pages(sbi, F2FS_DIRTY_DENTS);
 	si->ndirty_meta = get_pages(sbi, F2FS_DIRTY_META);
 	si->ndirty_data = get_pages(sbi, F2FS_DIRTY_DATA);
@@ -406,6 +407,9 @@ static int stat_show(struct seq_file *s, void *v)
 			   si->vw_cnt, si->max_vw_cnt);
 		seq_printf(s, "  - nodes: %4d in %4d\n",
 			   si->ndirty_node, si->node_pages);
+
+		seq_printf(s, "  - test nodes: %4d\n", si->test_ndirty_node);
+
 		seq_printf(s, "  - dents: %4d in dirs:%4d (%4d)\n",
 			   si->ndirty_dent, si->ndirty_dirs, si->ndirty_all);
 		seq_printf(s, "  - datas: %4d in files:%4d\n",

@@ -985,6 +985,7 @@ enum count_type {
 	F2FS_RD_META,
 	F2FS_DIO_WRITE,
 	F2FS_DIO_READ,
+	TEST_DIRTY_NODES,
 	NR_COUNT_TYPE,
 };
 
@@ -3291,6 +3292,7 @@ struct f2fs_stat_info {
 	unsigned long long hit_total, total_ext;
 	int ext_tree, zombie_tree, ext_node;
 	int ndirty_node, ndirty_dent, ndirty_meta, ndirty_imeta;
+	int test_ndirty_node;
 	int ndirty_data, ndirty_qdata;
 	int inmem_pages;
 	unsigned int ndirty_dirs, ndirty_files, nquota_files, ndirty_all;
