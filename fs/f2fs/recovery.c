@@ -745,7 +745,14 @@ next:
 		f2fs_put_page(page, 1);
 	}
 	if (!err)
+#ifdef CONFIG_F2FS_MULTI_LOG
+        /* NOTE: Recovery for streams is currently not supported, therefore
+         * use deault implementation on only stream 0
+         */
+		f2fs_allocate_new_segments(sbi, 0);
+#else
 		f2fs_allocate_new_segments(sbi);
+#endif
 	return err;
 }
 

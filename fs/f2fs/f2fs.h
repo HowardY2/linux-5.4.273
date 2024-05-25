@@ -27,6 +27,8 @@
 #include <linux/fscrypt.h>
 #include <linux/fsverity.h>
 
+// #define CONFIG_F2FS_MULTI_LOG
+
 #ifdef CONFIG_F2FS_CHECK_FS
 #define f2fs_bug_on(sbi, condition)	BUG_ON(condition)
 #else
@@ -117,6 +119,10 @@ typedef u32 block_t;	/*
 			 */
 typedef u32 nid_t;
 
+#define	NR_CURSEG_DATA_TYPE	(3)
+#define NR_CURSEG_NODE_TYPE	(3)
+#define NR_CURSEG_TYPE	(NR_CURSEG_DATA_TYPE + NR_CURSEG_NODE_TYPE)
+
 struct f2fs_mount_info {
 	unsigned int opt;
 	int write_io_size_bits;		/* Write IO size bits */
@@ -142,6 +148,16 @@ struct f2fs_mount_info {
 	block_t unusable_cap;		/* Amount of space allowed to be
 					 * unusable when disabling checkpoint
 					 */
+#ifdef CONFIG_F2FS_MULTI_LOG
+	uint arg_nr_max_logs; /* if user provides single number of max streams argument */
+    uint nr_max_logs; /* if user provided max streams per type we accummulate during 
+                            options parsing */
+    bool set_arg_nr_max_logs; /* indicate user provided single max streams */
+    bool set_arg_per_log_max; /* indicate user provided per stream maximums */
+    uint nr_logs[NR_CURSEG_TYPE];
+	uint rr_stride;
+	int log_alloc_policy; /* Stream allocation policy: SRR or SPF (default) */
+#endif
 };
 
 #define F2FS_FEATURE_ENCRYPT		0x0001
@@ -231,6 +247,17 @@ enum {
 					 */
 	META_GENERIC,
 };
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+/* 
+ * indicate stream allocation policy
+ */
+enum {
+    LOG_ALLOC_SRR, /* stream round robin */
+    LOG_ALLOC_SPF, /* stream pinned files */
+    LOG_ALLOC_AMFS, /* application managed file streams */
+};
+#endif
 
 /* for the list of ino */
 enum {
@@ -718,6 +745,20 @@ struct f2fs_inode_info {
 	int i_inline_xattr_size;	/* inline xattr size */
 	struct timespec64 i_crtime;	/* inode creation time */
 	struct timespec64 i_disk_time[4];/* inode disk times */
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+	unsigned int i_data_log; /* stream that the DATA of the inode is pinned to */
+    bool i_has_pinned_data_log; /* indicate stream pinning has been initialized */
+	unsigned int i_node_log; /* stream that the NODE of the inode is pinned to */
+    bool i_has_pinned_node_log; /* indicate stream pinning has been initialized */
+    bool i_has_exclusive_data_log; /* indicate if file holds a data stream exclusively */
+    bool i_should_release_log; /* indicate if file was deleted and should release stream */
+    spinlock_t i_logs_lock; /* lock the streams info */
+    bool i_has_logmap; /* indicate if the inode has an assigned bitmap */
+    bool i_has_logmap_init; /* indicate if streammap has been initialized */
+    unsigned int i_last_log; /* for rr allocation on bitmap store last allocated one */
+    unsigned int i_last_segno; /* stride RR allocation on stream to be in segment, gets closer to MDTS */
+#endif
 };
 
 static inline void get_extent_info(struct extent_info *ext,
@@ -890,9 +931,7 @@ static inline void set_new_dnode(struct dnode_of_data *dn, struct inode *inode,
  * Just in case, on-disk layout covers maximum 16 logs that consist of 8 for
  * data and 8 for node logs.
  */
-#define	NR_CURSEG_DATA_TYPE	(3)
-#define NR_CURSEG_NODE_TYPE	(3)
-#define NR_CURSEG_TYPE	(NR_CURSEG_DATA_TYPE + NR_CURSEG_NODE_TYPE)
+
 
 enum {
 	CURSEG_HOT_DATA	= 0,	/* directory entry blocks */
@@ -1022,6 +1061,20 @@ enum temp_type {
 	NR_TEMP_TYPE,
 };
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline enum page_type PAGE_TYPE_OF_TEMP_TYPE(unsigned int type)
+{
+    if (type < NR_CURSEG_DATA_TYPE)
+        return DATA;
+    else if (type >= NR_CURSEG_DATA_TYPE && type < NR_CURSEG_TYPE)
+        return NODE;
+
+    /* Anything not DATA or NODE is not supported by streams, hence just
+     * return something to indicate this */
+    return META;
+}
+#endif
+
 enum need_lock_type {
 	LOCK_REQ = 0,
 	LOCK_DONE,
@@ -1063,6 +1116,9 @@ struct f2fs_io_info {
 	nid_t ino;		/* inode number */
 	enum page_type type;	/* contains DATA/NODE/META/META_FLUSH */
 	enum temp_type temp;	/* contains HOT/WARM/COLD */
+#ifdef CONFIG_F2FS_MULTI_LOG 
+	uint log;	/* stream number */
+#endif
 	int op;			/* contains REQ_OP_ */
 	int op_flags;		/* req_flag_bits */
 	block_t new_blkaddr;	/* new block address to be written */
@@ -1370,6 +1426,22 @@ struct f2fs_sb_info {
 
 	/* Precomputed FS UUID checksum for seeding other checksums */
 	__u32 s_chksum_seed;
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+	uint nr_max_logs;
+    atomic_t nr_active_logs;
+    spinlock_t logmap_lock;
+    unsigned long **logmap; /* bitmap per TYPE to know active streams for each */
+    unsigned long logs_inomap[NR_CURSEG_TYPE * MAX_ACTIVE_LOGS]; /* Maintain the inode number that holds an exclusive stream */
+    spinlock_t rr_active_log_lock[NR_CURSEG_TYPE];
+    atomic_t rr_active_log[NR_CURSEG_TYPE];
+    atomic_t rr_stride_ctr[NR_CURSEG_TYPE];
+    spinlock_t resmap_lock;
+    unsigned long **resmap; /* bitmap per TYPE to maintain reserved exclusive streams for files */
+    bool busy_log[NR_CURSEG_TYPE * MAX_ACTIVE_LOGS]; /* flag to indicate if a stream cannot allocate a new section,
+                                                           must wait for an active zone to be released to allocate a new one */
+#endif
+
 };
 
 struct f2fs_private_dio {
@@ -3131,9 +3203,21 @@ block_t f2fs_get_unusable_blocks(struct f2fs_sb_info *sbi);
 int f2fs_disable_cp_again(struct f2fs_sb_info *sbi, block_t unusable);
 void f2fs_release_discard_addrs(struct f2fs_sb_info *sbi);
 int f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi, bool for_ra);
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+void allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
+					unsigned int start, unsigned int end, unsigned int log);
+#else
 void allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
 					unsigned int start, unsigned int end);
+#endif
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi, unsigned int log);
+#else
 void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi);
+#endif
+
 int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range);
 bool f2fs_exist_trim_candidates(struct f2fs_sb_info *sbi,
 					struct cp_control *cpc);
@@ -3153,10 +3237,17 @@ void f2fs_replace_block(struct f2fs_sb_info *sbi, struct dnode_of_data *dn,
 			block_t old_addr, block_t new_addr,
 			unsigned char version, bool recover_curseg,
 			bool recover_newaddr);
+#ifdef CONFIG_F2FS_MULTI_LOG
+void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
+		block_t old_blkaddr, block_t *new_blkaddr,
+		struct f2fs_summary *sum, int type,
+		struct f2fs_io_info *fio, bool add_list, unsigned int *log);
+#else
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			block_t old_blkaddr, block_t *new_blkaddr,
 			struct f2fs_summary *sum, int type,
 			struct f2fs_io_info *fio, bool add_list);
+#endif
 void f2fs_wait_on_page_writeback(struct page *page,
 			enum page_type type, bool ordered, bool locked);
 void f2fs_wait_on_block_writeback(struct inode *inode, block_t blkaddr);
@@ -3168,6 +3259,9 @@ int f2fs_lookup_journal_in_cursum(struct f2fs_journal *journal, int type,
 			unsigned int val, int alloc);
 void f2fs_flush_sit_entries(struct f2fs_sb_info *sbi, struct cp_control *cpc);
 int f2fs_build_segment_manager(struct f2fs_sb_info *sbi);
+#ifdef CONFIG_F2FS_MULTI_LOG
+int build_curseg_logs(struct f2fs_sb_info *sbi);
+#endif
 void f2fs_destroy_segment_manager(struct f2fs_sb_info *sbi);
 int __init f2fs_create_segment_manager_caches(void);
 void f2fs_destroy_segment_manager_caches(void);
@@ -3282,6 +3376,8 @@ bool f2fs_space_for_roll_forward(struct f2fs_sb_info *sbi);
 /*
  * debug.c
  */
+
+// #define  CONFIG_F2FS_STAT_FS
 #ifdef CONFIG_F2FS_STAT_FS
 struct f2fs_stat_info {
 	struct list_head stat_list;
@@ -3320,9 +3416,23 @@ struct f2fs_stat_info {
 	int tot_blks, data_blks, node_blks;
 	int bg_data_blks, bg_node_blks;
 	unsigned long long skipped_atomic_files[2];
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int nr_max_logs; /* user specified maximum active streams */
+    int nr_active_logs; /* currently active streams */
+	int curseg[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+	int cursec[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+	int curzone[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+	unsigned int dirty_seg[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+	unsigned int full_seg[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+	unsigned int valid_blks[MAX_ACTIVE_LOGS * NR_CURSEG_TYPE];
+#else
 	int curseg[NR_CURSEG_TYPE];
 	int cursec[NR_CURSEG_TYPE];
 	int curzone[NR_CURSEG_TYPE];
+	unsigned int dirty_seg[NR_CURSEG_TYPE];
+	unsigned int full_seg[NR_CURSEG_TYPE];
+	unsigned int valid_blks[NR_CURSEG_TYPE];
+#endif
 
 	unsigned int meta_count[META_MAX];
 	unsigned int segment_count[2];

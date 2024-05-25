@@ -517,6 +517,87 @@ int f2fs_try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink)
 /*
  * This function always returns success
  */
+
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+int f2fs_get_node_info(struct f2fs_sb_info *sbi, nid_t nid,
+						struct node_info *ni)
+{
+	struct f2fs_nm_info *nm_i = NM_I(sbi);
+	nid_t start_nid = START_NID(nid);
+	struct f2fs_nat_block *nat_blk;
+	struct page *page = NULL;
+	struct f2fs_nat_entry ne;
+	struct nat_entry *e;
+	pgoff_t index;
+	block_t blkaddr;
+	int i;
+	uint num_hot_data_logs = __get_number_active_logs_for_type(sbi, CURSEG_HOT_DATA);
+	uint checked_logs = 0;
+	struct curseg_info *curseg;
+	struct f2fs_journal *journal;
+
+check_next_log:
+	curseg = CURSEG_I(sbi, checked_logs * NR_CURSEG_TYPE + CURSEG_HOT_DATA);
+	journal = curseg->journal;
+
+	ni->nid = nid;
+
+	/* Check nat cache */
+	down_read(&nm_i->nat_tree_lock);
+	e = __lookup_nat_cache(nm_i, nid);
+	if (e) {
+		ni->ino = nat_get_ino(e);
+		ni->blk_addr = nat_get_blkaddr(e);
+		ni->version = nat_get_version(e);
+		up_read(&nm_i->nat_tree_lock);
+		return 0;
+	}
+
+	memset(&ne, 0, sizeof(struct f2fs_nat_entry));
+
+	/* Check current segment summary */
+	down_read(&curseg->journal_rwsem);
+	i = f2fs_lookup_journal_in_cursum(journal, NAT_JOURNAL, nid, 0);
+	if (i >= 0) {
+		ne = nat_in_journal(journal, i);
+		node_info_from_raw_nat(ni, &ne);
+	}
+	up_read(&curseg->journal_rwsem);
+	if (i >= 0) {
+		up_read(&nm_i->nat_tree_lock);
+		goto cache;
+	}
+
+	checked_logs++;
+	if( checked_logs < num_hot_data_logs) {
+		up_read(&nm_i->nat_tree_lock);
+		goto check_next_log;
+	}
+
+	/* Fill node_info from nat page */
+	index = current_nat_addr(sbi, nid);
+	up_read(&nm_i->nat_tree_lock);
+
+	page = f2fs_get_meta_page(sbi, index);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+
+	nat_blk = (struct f2fs_nat_block *)page_address(page);
+	ne = nat_blk->entries[nid - start_nid];
+	node_info_from_raw_nat(ni, &ne);
+	f2fs_put_page(page, 1);
+cache:
+	blkaddr = le32_to_cpu(ne.block_addr);
+	if (__is_valid_data_blkaddr(blkaddr) &&
+		!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC_ENHANCE))
+		return -EFAULT;
+
+	/* cache nat entry */
+	cache_nat_entry(sbi, nid, &ne);
+	return 0;
+}
+#else
 int f2fs_get_node_info(struct f2fs_sb_info *sbi, nid_t nid,
 						struct node_info *ni)
 {
@@ -582,6 +663,7 @@ cache:
 	cache_nat_entry(sbi, nid, &ne);
 	return 0;
 }
+#endif
 
 /*
  * readahead MAX_RA_NODE number of node pages.

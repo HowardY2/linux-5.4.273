@@ -201,6 +201,9 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	if (unlikely(security_inode_alloc(inode)))
 		return -ENOMEM;
 	this_cpu_inc(nr_inodes);
+	inode->i_exclusive_data_log = false;
+    inode->i_has_logmap = false;
+    inode->i_logmap = 0;
 
 	return 0;
 }

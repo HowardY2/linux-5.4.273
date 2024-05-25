@@ -559,6 +559,11 @@ void f2fs_release_ino_entry(struct f2fs_sb_info *sbi, bool all)
 
 		spin_lock(&im->ino_lock);
 		list_for_each_entry_safe(e, tmp, &im->ino_list, list) {
+#ifdef CONFIG_F2FS_MULTI_LOG
+            if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SRR 
+                    && __test_ino_holds_exclusive_log(sbi, e->ino))
+                __clear_exclusive_data_log(sbi, e->ino);
+#endif
 			list_del(&e->list);
 			radix_tree_delete(&im->ino_root, e->ino);
 			kmem_cache_free(ino_entry_slab, e);

@@ -54,6 +54,12 @@
 #define F_GET_FILE_RW_HINT	(F_LINUX_SPECIFIC_BASE + 13)
 #define F_SET_FILE_RW_HINT	(F_LINUX_SPECIFIC_BASE + 14)
 
+/* Set/Unset exlusive stream request for an inode. */
+#define F_SET_EXCLUSIVE_DATA_LOG  (F_LINUX_SPECIFIC_BASE + 15)
+#define F_UNSET_EXCLUSIVE_DATA_LOG  (F_LINUX_SPECIFIC_BASE + 16)
+
+#define F_SET_DATA_LOG_MAP  (F_LINUX_SPECIFIC_BASE + 17)
+
 /*
  * Valid hint values for F_{GET,SET}_RW_HINT. 0 is "not set", or can be
  * used to clear any hints previously set.

@@ -2111,6 +2111,18 @@ static bool __mark_sit_entry_dirty(struct f2fs_sb_info *sbi, unsigned int segno)
 	return true;
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void __set_sit_entry_type_and_log(struct f2fs_sb_info *sbi, int type,
+					unsigned int segno, int modified, unsigned int log)
+{
+	struct seg_entry *se = get_seg_entry(sbi, segno);
+
+	se->type = type;
+    se->log = log;
+	if (modified)
+		__mark_sit_entry_dirty(sbi, segno);
+}
+#else
 static void __set_sit_entry_type(struct f2fs_sb_info *sbi, int type,
 					unsigned int segno, int modified)
 {
@@ -2119,6 +2131,18 @@ static void __set_sit_entry_type(struct f2fs_sb_info *sbi, int type,
 	if (modified)
 		__mark_sit_entry_dirty(sbi, segno);
 }
+#endif
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void __init_sit_entry_log(struct f2fs_sb_info *sbi, unsigned int segno,
+        unsigned int log)
+{
+	struct seg_entry *se;
+
+	se = get_seg_entry(sbi, segno);
+    se->log = log;
+}
+#endif
 
 static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 {
@@ -2270,6 +2294,16 @@ bool f2fs_is_checkpointed_data(struct f2fs_sb_info *sbi, block_t blkaddr)
 /*
  * This function should be resided under the curseg_mutex lock
  */
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void __add_sum_entry(struct f2fs_sb_info *sbi, int type,
+					struct f2fs_summary *sum, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	void *addr = curseg->sum_blk;
+	addr += curseg->next_blkoff * sizeof(struct f2fs_summary);
+	memcpy(addr, sum, sizeof(struct f2fs_summary));
+}
+#else
 static void __add_sum_entry(struct f2fs_sb_info *sbi, int type,
 					struct f2fs_summary *sum)
 {
@@ -2278,6 +2312,7 @@ static void __add_sum_entry(struct f2fs_sb_info *sbi, int type,
 	addr += curseg->next_blkoff * sizeof(struct f2fs_summary);
 	memcpy(addr, sum, sizeof(struct f2fs_summary));
 }
+#endif
 
 /*
  * Calculate the number of current summary pages for writing
@@ -2335,6 +2370,33 @@ static void write_sum_page(struct f2fs_sb_info *sbi,
 	f2fs_update_meta_page(sbi, (void *)sum_blk, blk_addr);
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void write_current_sum_page_at_log(struct f2fs_sb_info *sbi,
+						int type, block_t blk_addr, int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	struct page *page = f2fs_grab_meta_page(sbi, blk_addr);
+	struct f2fs_summary_block *src = curseg->sum_blk;
+	struct f2fs_summary_block *dst;
+
+	dst = (struct f2fs_summary_block *)page_address(page);
+	memset(dst, 0, PAGE_SIZE);
+
+	mutex_lock(&curseg->curseg_mutex);
+
+	down_read(&curseg->journal_rwsem);
+	memcpy(&dst->journal, curseg->journal, SUM_JOURNAL_SIZE);
+	up_read(&curseg->journal_rwsem);
+
+	memcpy(dst->entries, src->entries, SUM_ENTRY_SIZE);
+	memcpy(&dst->footer, &src->footer, SUM_FOOTER_SIZE);
+
+	mutex_unlock(&curseg->curseg_mutex);
+
+	set_page_dirty(page);
+	f2fs_put_page(page, 1);
+}
+#else
 static void write_current_sum_page(struct f2fs_sb_info *sbi,
 						int type, block_t blk_addr)
 {
@@ -2360,7 +2422,20 @@ static void write_current_sum_page(struct f2fs_sb_info *sbi,
 	set_page_dirty(page);
 	f2fs_put_page(page, 1);
 }
+#endif
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int is_next_segment_free(struct f2fs_sb_info *sbi,
+				struct curseg_info *curseg, int type)
+{
+	unsigned int segno = curseg->segno + 1;
+	struct free_segmap_info *free_i = FREE_I(sbi);
+
+	if (segno < MAIN_SEGS(sbi) && segno % sbi->segs_per_sec)
+		return !test_bit(segno, free_i->free_segmap);
+	return 0;
+}
+#else
 static int is_next_segment_free(struct f2fs_sb_info *sbi, int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
@@ -2371,6 +2446,7 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi, int type)
 		return !test_bit(segno, free_i->free_segmap);
 	return 0;
 }
+#endif
 
 /*
  * Find a new segment from the free segments bitmap to right order
@@ -2388,6 +2464,9 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
 	bool init = true;
 	int go_left = 0;
 	int i;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int j;
+#endif
 
 	spin_lock(&free_i->segmap_lock);
 
@@ -2440,9 +2519,18 @@ skip_left:
 		if (go_left && zoneno == 0)
 			goto got_it;
 	}
+#ifdef CONFIG_F2FS_MULTI_LOG
+	for (i = 0; i < NR_CURSEG_TYPE; i++) {
+        for (j = 0; j < __get_number_active_logs_for_type(sbi, i); j++) {
+            if (CURSEG_I(sbi, j * NR_CURSEG_TYPE + i)->zone == zoneno)
+                break;
+        }
+    }
+#else
 	for (i = 0; i < NR_CURSEG_TYPE; i++)
 		if (CURSEG_I(sbi, i)->zone == zoneno)
 			break;
+#endif
 
 	if (i < NR_CURSEG_TYPE) {
 		/* zone is in user, try another */
@@ -2463,6 +2551,26 @@ got_it:
 	spin_unlock(&free_i->segmap_lock);
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	struct summary_footer *sum_footer;
+
+	curseg->segno = curseg->next_segno;
+	curseg->zone = GET_ZONE_FROM_SEG(sbi, curseg->segno);
+	curseg->next_blkoff = 0;
+	curseg->next_segno = NULL_SEGNO;
+
+	sum_footer = &(curseg->sum_blk->footer);
+	memset(sum_footer, 0, sizeof(struct summary_footer));
+	if (IS_DATASEG(type))
+		SET_SUM_TYPE(sum_footer, SUM_TYPE_DATA);
+	if (IS_NODESEG(type))
+		SET_SUM_TYPE(sum_footer, SUM_TYPE_NODE);
+	__set_sit_entry_type_and_log(sbi, type, curseg->segno, modified, log);
+}
+#else
 static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
@@ -2481,7 +2589,32 @@ static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
 		SET_SUM_TYPE(sum_footer, SUM_TYPE_NODE);
 	__set_sit_entry_type(sbi, type, curseg->segno, modified);
 }
+#endif
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type, unsigned int log)
+{
+	/* if segs_per_sec is large than 1, we need to keep original policy. */
+	if (__is_large_section(sbi))
+		return CURSEG_I(sbi, log * NR_CURSEG_TYPE + type)->segno;
+
+	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
+		return 0;
+
+	if (test_opt(sbi, NOHEAP) &&
+		(type == CURSEG_HOT_DATA || IS_NODESEG(type)))
+		return 0;
+
+	if (SIT_I(sbi)->last_victim[ALLOC_NEXT])
+		return SIT_I(sbi)->last_victim[ALLOC_NEXT];
+
+	/* find segments from 0 to reuse freed segments */
+	if (F2FS_OPTION(sbi).alloc_mode == ALLOC_MODE_REUSE)
+		return 0;
+
+	return CURSEG_I(sbi, log * NR_CURSEG_TYPE + type)->segno;
+}
+#else
 static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
 {
 	/* if segs_per_sec is large than 1, we need to keep original policy. */
@@ -2504,11 +2637,35 @@ static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
 
 	return CURSEG_I(sbi, type)->segno;
 }
+#endif
 
 /*
  * Allocate a current working segment.
  * This function always allocates a free segment in LFS manner.
  */
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	unsigned int segno = curseg->segno;
+	int dir = ALLOC_LEFT;
+
+	write_sum_page(sbi, curseg->sum_blk,
+				GET_SUM_BLOCK(sbi, segno));
+	if (type == CURSEG_WARM_DATA || type == CURSEG_COLD_DATA)
+		dir = ALLOC_RIGHT;
+
+	if (test_opt(sbi, NOHEAP))
+		dir = ALLOC_RIGHT;
+
+	segno = __get_next_segno(sbi, type, log);
+	get_new_segment(sbi, &segno, new_sec, dir);
+	curseg->next_segno = segno;
+	curseg->log = log;
+	reset_curseg(sbi, type, 1, log);
+	curseg->alloc_type = LFS;
+}
+#else
 static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
@@ -2529,6 +2686,7 @@ static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 	reset_curseg(sbi, type, 1);
 	curseg->alloc_type = LFS;
 }
+#endif
 
 static void __next_free_blkoff(struct f2fs_sb_info *sbi,
 			struct curseg_info *seg, block_t start)
@@ -2566,6 +2724,39 @@ static void __refresh_next_blkoff(struct f2fs_sb_info *sbi,
  * This function always allocates a used segment(from dirty seglist) by SSR
  * manner, so it should recover the existing segment information of valid blocks
  */
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void change_curseg(struct f2fs_sb_info *sbi, int type, unsigned int log)
+{
+	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	unsigned int new_segno = curseg->next_segno;
+	struct f2fs_summary_block *sum_node;
+	struct page *sum_page;
+
+	write_sum_page(sbi, curseg->sum_blk,
+				GET_SUM_BLOCK(sbi, curseg->segno));
+	__set_test_and_inuse(sbi, new_segno);
+
+	mutex_lock(&dirty_i->seglist_lock);
+	__remove_dirty_segment(sbi, new_segno, PRE);
+	__remove_dirty_segment(sbi, new_segno, DIRTY);
+	mutex_unlock(&dirty_i->seglist_lock);
+
+	reset_curseg(sbi, type, 1, log);
+	curseg->alloc_type = SSR;
+	__next_free_blkoff(sbi, curseg, 0);
+
+	sum_page = f2fs_get_sum_page(sbi, new_segno);
+	if (IS_ERR(sum_page)) {
+		/* GC won't be able to use stale summary pages by cp_error */
+		memset(curseg->sum_blk, 0, SUM_ENTRY_SIZE);
+		return;
+	}
+	sum_node = (struct f2fs_summary_block *)page_address(sum_page);
+	memcpy(curseg->sum_blk, sum_node, SUM_ENTRY_SIZE);
+	f2fs_put_page(sum_page, 1);
+}
+#else
 static void change_curseg(struct f2fs_sb_info *sbi, int type)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
@@ -2597,7 +2788,62 @@ static void change_curseg(struct f2fs_sb_info *sbi, int type)
 	memcpy(curseg->sum_blk, sum_node, SUM_ENTRY_SIZE);
 	f2fs_put_page(sum_page, 1);
 }
+#endif
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int get_ssr_segment(struct f2fs_sb_info *sbi, int type, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	const struct victim_selection *v_ops = DIRTY_I(sbi)->v_ops;
+	unsigned segno = NULL_SEGNO;
+	int i, cnt;
+	bool reversed = false;
+
+	/* f2fs_need_SSR() already forces to do this */
+	if (v_ops->get_victim(sbi, &segno, BG_GC, type, SSR)) {
+		curseg->next_segno = segno;
+		return 1;
+	}
+
+	/* For node segments, let's do SSR more intensively */
+	if (IS_NODESEG(type)) {
+		if (type >= CURSEG_WARM_NODE) {
+			reversed = true;
+			i = CURSEG_COLD_NODE;
+		} else {
+			i = CURSEG_HOT_NODE;
+		}
+		cnt = NR_CURSEG_NODE_TYPE;
+	} else {
+		if (type >= CURSEG_WARM_DATA) {
+			reversed = true;
+			i = CURSEG_COLD_DATA;
+		} else {
+			i = CURSEG_HOT_DATA;
+		}
+		cnt = NR_CURSEG_DATA_TYPE;
+	}
+
+	for (; cnt-- > 0; reversed ? i-- : i++) {
+		if (i == type)
+			continue;
+		if (v_ops->get_victim(sbi, &segno, BG_GC, i, SSR)) {
+			curseg->next_segno = segno;
+			return 1;
+		}
+	}
+
+	/* find valid_blocks=0 in dirty list */
+	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
+		segno = get_free_segment(sbi);
+		if (segno != NULL_SEGNO) {
+			curseg->next_segno = segno;
+			return 1;
+		}
+	}
+	return 0;
+}
+#else
 static int get_ssr_segment(struct f2fs_sb_info *sbi, int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
@@ -2650,11 +2896,34 @@ static int get_ssr_segment(struct f2fs_sb_info *sbi, int type)
 	}
 	return 0;
 }
+#endif
 
 /*
  * flush out current segment and replace it with new segment
  * This function should be returned with success, otherwise BUG
  */
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
+						int type, bool force, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+
+	if (force)
+		new_curseg(sbi, type, true, log);
+	else if (!is_set_ckpt_flags(sbi, CP_CRC_RECOVERY_FLAG) &&
+					type == CURSEG_WARM_NODE)
+		new_curseg(sbi, type, false, log);
+	else if (curseg->alloc_type == LFS && is_next_segment_free(sbi, curseg, type) &&
+			likely(!is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
+		new_curseg(sbi, type, false, log);
+	else if (f2fs_need_SSR(sbi) && get_ssr_segment(sbi, type, log))
+		change_curseg(sbi, type, log);
+	else
+		new_curseg(sbi, type, false, log);
+
+	stat_inc_seg_type(sbi, curseg);
+}
+#else
 static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
 						int type, bool force)
 {
@@ -2675,7 +2944,42 @@ static void allocate_segment_by_default(struct f2fs_sb_info *sbi,
 
 	stat_inc_seg_type(sbi, curseg);
 }
+#endif
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+void allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
+					unsigned int start, unsigned int end, unsigned int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	unsigned int segno;
+
+	down_read(&SM_I(sbi)->curseg_lock);
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&SIT_I(sbi)->sentry_lock);
+
+	segno = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type)->segno;
+	if (segno < start || segno > end)
+		goto unlock;
+
+	if (f2fs_need_SSR(sbi) && get_ssr_segment(sbi, type, log))
+		change_curseg(sbi, type, log);
+	else
+		new_curseg(sbi, type, true, log);
+
+	stat_inc_seg_type(sbi, curseg);
+
+	locate_dirty_segment(sbi, segno);
+unlock:
+	up_write(&SIT_I(sbi)->sentry_lock);
+
+	if (segno != curseg->segno)
+		f2fs_notice(sbi, "For resize: curseg of type %d: %u ==> %u",
+			    type, segno, curseg->segno);
+
+	mutex_unlock(&curseg->curseg_mutex);
+	up_read(&SM_I(sbi)->curseg_lock);
+}
+#else
 void allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
 					unsigned int start, unsigned int end)
 {
@@ -2708,7 +3012,27 @@ unlock:
 	mutex_unlock(&curseg->curseg_mutex);
 	up_read(&SM_I(sbi)->curseg_lock);
 }
+#endif
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi, unsigned int log)
+{
+	struct curseg_info *curseg;
+	unsigned int old_segno;
+	int i;
+
+	down_write(&SIT_I(sbi)->sentry_lock);
+
+	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++) {
+		curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + i);
+		old_segno = curseg->segno;
+		SIT_I(sbi)->s_ops->allocate_segment(sbi, i, true, log);
+		locate_dirty_segment(sbi, old_segno);
+	}
+
+	up_write(&SIT_I(sbi)->sentry_lock);
+}
+#else
 void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 {
 	struct curseg_info *curseg;
@@ -2726,6 +3050,7 @@ void f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 
 	up_write(&SIT_I(sbi)->sentry_lock);
 }
+#endif
 
 static const struct segment_allocation default_salloc_ops = {
 	.allocate_segment = allocate_segment_by_default,
@@ -2892,12 +3217,9 @@ out:
 	return err;
 }
 
-static bool __has_curseg_space(struct f2fs_sb_info *sbi, int type)
+static bool __has_curseg_space(struct f2fs_sb_info *sbi, struct curseg_info *curseg)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	if (curseg->next_blkoff < sbi->blocks_per_seg)
-		return true;
-	return false;
+	return curseg->next_blkoff < sbi->blocks_per_seg;
 }
 
 int f2fs_rw_hint_to_seg_type(enum rw_hint hint)
@@ -3080,6 +3402,205 @@ static int __get_segment_type(struct f2fs_io_info *fio)
 	return type;
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static unsigned int __get_log_rr_policy(struct f2fs_sb_info *sbi, 
+        unsigned int type)
+{
+    return __get_current_log_and_set_next_log_active(sbi, type);
+}
+
+static unsigned int __get_log_spf_policy(struct f2fs_sb_info *sbi, 
+        unsigned int type, struct f2fs_io_info *fio)
+{
+    struct inode *inode = fio->page->mapping->host;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+    unsigned int log = 0;
+    enum page_type ptype = PAGE_TYPE_OF_TEMP_TYPE(type);
+
+    spin_lock(&fi->i_logs_lock);
+
+    if (ptype == DATA) {
+        if (!fi->i_has_pinned_data_log)
+            log = __set_and_return_file_data_log(sbi, type, inode);
+        else if (!inode->i_exclusive_data_log &&
+                __test_log_reserved(sbi, type, fi->i_data_log)) {
+            /* another file has exclusively claimed log, need to migrate */
+            log = __set_and_return_file_data_log(sbi, type, inode);
+        } else
+            log = fi->i_data_log;
+    } else if (ptype == NODE) {
+        /* NOTE: Currently no NODE logs are supported, therefore everything
+         * is on log 0. Once added, logic is same as for DATA. */
+        log = 0;
+    } else if (ptype == META) {
+        /* This is for pinned files or SSR (which LFS and hence multi-logs 
+         * does not support). If there are pinned files, it goes to the 
+         * default log 0 */
+        log = 0;
+    }
+
+    /* file no longer needs exclusive data log, release the exclusive log.
+     * Any inode flag change should trigger this, therefore it is independent of 
+     * the ptype. Since only DATA can have logs, technically it will only release
+     * these particular logs.
+     */
+    if (!inode->i_exclusive_data_log && fi->i_has_exclusive_data_log)
+        __release_exclusive_data_log(sbi, inode);
+
+    spin_unlock(&fi->i_logs_lock);
+
+    return log;
+}
+
+static unsigned int __get_log_amfs_policy(struct f2fs_sb_info *sbi, 
+        unsigned int type, struct f2fs_io_info *fio)
+{
+    struct inode *inode = fio->page->mapping->host;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+    unsigned int log = 0;
+    enum page_type ptype = PAGE_TYPE_OF_TEMP_TYPE(type);
+
+    spin_lock(&fi->i_logs_lock);
+
+    if (ptype == DATA) {
+        if (inode->i_has_logmap && (fi->i_has_logmap || !fi->i_has_logmap_init))
+            log = __get_log_from_inode_logmap(sbi, type, inode);
+        else
+            log = 0;
+    } else if (ptype == NODE)
+        log = 0;
+    else if (ptype == META)
+        log = 0;
+
+    spin_unlock(&fi->i_logs_lock);
+
+    return log;
+}
+
+
+static unsigned int f2fs_get_curseg_log(struct f2fs_sb_info *sbi, 
+        int type, struct f2fs_io_info *fio)
+{
+    if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SRR)
+        return __get_log_rr_policy(sbi, type);
+    else if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SPF)
+        return __get_log_spf_policy(sbi, type, fio);
+    else
+        return __get_log_amfs_policy(sbi, type, fio);
+}
+#endif
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
+		block_t old_blkaddr, block_t *new_blkaddr,
+		struct f2fs_summary *sum, int type,
+		struct f2fs_io_info *fio, bool add_list, unsigned int *log)
+{
+	struct sit_info *sit_i = SIT_I(sbi);
+	struct curseg_info *curseg;
+	unsigned int active_logs;
+
+	*log = f2fs_get_curseg_log(sbi, type, fio);
+	curseg = CURSEG_I(sbi, *log * NR_CURSEG_TYPE + type);
+
+	down_read(&SM_I(sbi)->curseg_lock);
+
+	/* If NULL_SEGNO log is out of space on the device, this should be a rare occasion where we
+     * ignore the assigned log and use a First Fit policy into other logs of the type.
+     *
+     * At least one of the logs MUST still have space, because otherwise we would
+     * have done foreground GC before calling f2fs_allocate_data_block.
+     *
+     * Second scenario we test if curseg has space, and if not check if the section
+     * is full and we have reached maximum number of active zones. If so, we
+     * cannot successfully allocate a new section for the log. Then also fall back
+     * to first fit for the file.
+     */
+    if (unlikely(curseg->segno == NULL_SEGNO)) {
+        *log = 0;
+        active_logs = __get_number_active_logs_for_type(sbi, type);
+
+        while (*log < active_logs - 1) {
+            /* release prior curseg lock */
+            up_read(&SM_I(sbi)->curseg_lock);
+
+            curseg = CURSEG_I(sbi, *log * NR_CURSEG_TYPE + type);
+            down_read(&SM_I(sbi)->curseg_lock);
+
+            /* found a log with space in the curseg and/or remaining space in the
+             * section to allocate a new curseg */
+            if (curseg->segno != NULL_SEGNO && (__has_curseg_space(sbi, curseg) 
+                        || !__has_cursec_reached_last_seg(sbi, curseg->segno)))
+                break;
+
+            (*log)++;
+        }
+    }
+
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&sit_i->sentry_lock);
+
+	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
+
+	f2fs_wait_discard_bio(sbi, *new_blkaddr);
+
+	/*
+	 * __add_sum_entry should be resided under the curseg_mutex
+	 * because, this function updates a summary entry in the
+	 * current summary block.
+	 */
+	__add_sum_entry(sbi, type, sum, *log);
+
+	__refresh_next_blkoff(sbi, curseg);
+
+	stat_inc_block_count(sbi, curseg);
+
+	/*
+	 * SIT information should be updated before segment allocation,
+	 * since SSR needs latest valid block information.
+	 */
+	update_sit_entry(sbi, *new_blkaddr, 1);
+	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
+		update_sit_entry(sbi, old_blkaddr, -1);
+
+	if (!__has_curseg_space(sbi, curseg))
+		sit_i->s_ops->allocate_segment(sbi, type, false, *log);
+
+	/*
+	 * segment dirty status should be updated after segment allocation,
+	 * so we just need to update status only one time after previous
+	 * segment being closed.
+	 */
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, *new_blkaddr));
+
+	up_write(&sit_i->sentry_lock);
+
+	if (page && IS_NODESEG(type)) {
+		fill_node_footer_blkaddr(page, NEXT_FREE_BLKADDR(sbi, curseg));
+
+		f2fs_inode_chksum_set(sbi, page);
+	}
+
+	if (F2FS_IO_ALIGNED(sbi))
+		fio->retry = false;
+
+	if (add_list) {
+		struct f2fs_bio_info *io;
+
+		INIT_LIST_HEAD(&fio->list);
+		fio->in_list = true;
+		io = sbi->write_io[fio->type] + fio->temp;
+		spin_lock(&io->io_lock);
+		list_add_tail(&fio->list, &io->io_list);
+		spin_unlock(&io->io_lock);
+	}
+
+	mutex_unlock(&curseg->curseg_mutex);
+
+	up_read(&SM_I(sbi)->curseg_lock);
+}
+#else
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		block_t old_blkaddr, block_t *new_blkaddr,
 		struct f2fs_summary *sum, int type,
@@ -3116,7 +3637,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
 		update_sit_entry(sbi, old_blkaddr, -1);
 
-	if (!__has_curseg_space(sbi, type))
+	if (!__has_curseg_space(sbi, curseg))
 		sit_i->s_ops->allocate_segment(sbi, type, false);
 
 	/*
@@ -3153,6 +3674,7 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 
 	up_read(&SM_I(sbi)->curseg_lock);
 }
+#endif
 
 static void update_device_state(struct f2fs_io_info *fio)
 {
@@ -3183,8 +3705,13 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 	if (keep_order)
 		down_read(&fio->sbi->io_order_lock);
 reallocate:
+#ifdef CONFIG_F2FS_MULTI_LOG
+	f2fs_allocate_data_block(fio->sbi, fio->page, fio->old_blkaddr,
+			&fio->new_blkaddr, sum, type, fio, true, &fio->log);
+#else
 	f2fs_allocate_data_block(fio->sbi, fio->page, fio->old_blkaddr,
 			&fio->new_blkaddr, sum, type, fio, true);
+#endif
 	if (GET_SEGNO(fio->sbi, fio->old_blkaddr) != NULL_SEGNO)
 		invalidate_mapping_pages(META_MAPPING(fio->sbi),
 					fio->old_blkaddr, fio->old_blkaddr);
@@ -3209,6 +3736,10 @@ void f2fs_do_write_meta_page(struct f2fs_sb_info *sbi, struct page *page,
 		.sbi = sbi,
 		.type = META,
 		.temp = HOT,
+#ifdef CONFIG_F2FS_MULTI_LOG
+        /* Currently we only use streams for DATA, hence META is pinned to stream 0. */
+        .log = 0, 
+#endif
 		.op = REQ_OP_WRITE,
 		.op_flags = REQ_SYNC | REQ_META | REQ_PRIO,
 		.old_blkaddr = page->index,
@@ -3285,7 +3816,23 @@ int f2fs_inplace_write_data(struct f2fs_io_info *fio)
 
 	return err;
 }
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline int __f2fs_get_curseg(struct f2fs_sb_info *sbi,
+						unsigned int segno)
+{
+	int i, j;
+	unsigned int logs = 0;
 
+	for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
+		logs = __get_number_active_logs_for_type(sbi, i);
+		for(j = 0; j < logs; j++){
+			if (CURSEG_I(sbi, j * NR_CURSEG_TYPE + i)->segno == segno)
+				break;
+		}
+	}
+	return i;
+}
+#else
 static inline int __f2fs_get_curseg(struct f2fs_sb_info *sbi,
 						unsigned int segno)
 {
@@ -3297,6 +3844,7 @@ static inline int __f2fs_get_curseg(struct f2fs_sb_info *sbi,
 	}
 	return i;
 }
+#endif
 
 void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 				block_t old_blkaddr, block_t new_blkaddr,
@@ -3345,11 +3893,21 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	/* change the current segment */
 	if (segno != curseg->segno) {
 		curseg->next_segno = segno;
+#ifdef CONFIG_F2FS_MULTI_LOG
+		/* NOTE: No support for block replacing with streams */
+		change_curseg(sbi, type, 0);
+#else
 		change_curseg(sbi, type);
+#endif
 	}
 
 	curseg->next_blkoff = GET_BLKOFF_FROM_SEG0(sbi, new_blkaddr);
+#ifdef CONFIG_F2FS_MULTI_LOG
+	/* NOTE: No support for block replacing with streams */
+	__add_sum_entry(sbi, type, sum, 0);
+#else
 	__add_sum_entry(sbi, type, sum);
+#endif
 
 	if (!recover_curseg || recover_newaddr)
 		update_sit_entry(sbi, new_blkaddr, 1);
@@ -3367,7 +3925,12 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	if (recover_curseg) {
 		if (old_cursegno != curseg->segno) {
 			curseg->next_segno = old_cursegno;
+#ifdef CONFIG_F2FS_MULTI_LOG
+			/* NOTE: No support for block replacing with streams */
+			change_curseg(sbi, type, 0);
+#else
 			change_curseg(sbi, type);
+#endif
 		}
 		curseg->next_blkoff = old_blkoff;
 	}
@@ -3469,7 +4032,14 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 		segno = le32_to_cpu(ckpt->cur_data_segno[i]);
 		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[i]);
 		seg_i->next_segno = segno;
+#ifdef CONFIG_F2FS_MULTI_LOG
+		/* NOTE: summaries are currently not supported for streams, therefore
+         * only use summaries on stream 0 (default implementation)
+         */
+		reset_curseg(sbi, i, 0, 0);
+#else
 		reset_curseg(sbi, i, 0);
+#endif
 		seg_i->alloc_type = ckpt->alloc_type[i];
 		seg_i->next_blkoff = blk_off;
 
@@ -3499,6 +4069,80 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 	return 0;
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int read_normal_summaries(struct f2fs_sb_info *sbi, int type, unsigned int log)
+{
+	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
+	struct f2fs_summary_block *sum;
+	struct curseg_info *curseg;
+	struct page *new;
+	unsigned short blk_off;
+	unsigned int segno = 0;
+	block_t blk_addr = 0;
+	int err = 0;
+
+	/* get segment number and block addr */
+	if (IS_DATASEG(type)) {
+		segno = le32_to_cpu(ckpt->cur_data_segno[type]);
+		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[type -
+							CURSEG_HOT_DATA]);
+		if (__exist_node_summaries(sbi))
+			blk_addr = sum_blk_addr(sbi, NR_CURSEG_TYPE, type);
+		else
+			blk_addr = sum_blk_addr(sbi, NR_CURSEG_DATA_TYPE, type);
+	} else {
+		segno = le32_to_cpu(ckpt->cur_node_segno[type -
+							CURSEG_HOT_NODE]);
+		blk_off = le16_to_cpu(ckpt->cur_node_blkoff[type -
+							CURSEG_HOT_NODE]);
+		if (__exist_node_summaries(sbi))
+			blk_addr = sum_blk_addr(sbi, NR_CURSEG_NODE_TYPE,
+							type - CURSEG_HOT_NODE);
+		else
+			blk_addr = GET_SUM_BLOCK(sbi, segno);
+	}
+
+	new = f2fs_get_meta_page(sbi, blk_addr);
+	if (IS_ERR(new))
+		return PTR_ERR(new);
+	sum = (struct f2fs_summary_block *)page_address(new);
+
+	if (IS_NODESEG(type)) {
+		if (__exist_node_summaries(sbi)) {
+			struct f2fs_summary *ns = &sum->entries[0];
+			int i;
+			for (i = 0; i < sbi->blocks_per_seg; i++, ns++) {
+				ns->version = 0;
+				ns->ofs_in_node = 0;
+			}
+		} else {
+			err = f2fs_restore_node_summary(sbi, segno, sum);
+			if (err)
+				goto out;
+		}
+	}
+
+	/* set uncompleted segment to curseg */
+	curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	mutex_lock(&curseg->curseg_mutex);
+
+	/* update journal info */
+	down_write(&curseg->journal_rwsem);
+	memcpy(curseg->journal, &sum->journal, SUM_JOURNAL_SIZE);
+	up_write(&curseg->journal_rwsem);
+
+	memcpy(curseg->sum_blk->entries, sum->entries, SUM_ENTRY_SIZE);
+	memcpy(&curseg->sum_blk->footer, &sum->footer, SUM_FOOTER_SIZE);
+	curseg->next_segno = segno;
+	reset_curseg(sbi, type, 0, log);
+	curseg->alloc_type = ckpt->alloc_type[type];
+	curseg->next_blkoff = blk_off;
+	mutex_unlock(&curseg->curseg_mutex);
+out:
+	f2fs_put_page(new, 1);
+	return err;
+}
+#else
 static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
@@ -3571,6 +4215,7 @@ out:
 	f2fs_put_page(new, 1);
 	return err;
 }
+#endif
 
 static int restore_curseg_summaries(struct f2fs_sb_info *sbi)
 {
@@ -3578,6 +4223,10 @@ static int restore_curseg_summaries(struct f2fs_sb_info *sbi)
 	struct f2fs_journal *nat_j = CURSEG_I(sbi, CURSEG_HOT_DATA)->journal;
 	int type = CURSEG_HOT_DATA;
 	int err;
+#ifdef CONFIG_F2FS_MULTI_LOG
+    int j;
+    unsigned int logs;
+#endif
 
 	if (is_set_ckpt_flags(sbi, CP_COMPACT_SUM_FLAG)) {
 		int npages = f2fs_npages_for_summary_flush(sbi, true);
@@ -3596,12 +4245,22 @@ static int restore_curseg_summaries(struct f2fs_sb_info *sbi)
 	if (__exist_node_summaries(sbi))
 		f2fs_ra_meta_pages(sbi, sum_blk_addr(sbi, NR_CURSEG_TYPE, type),
 					NR_CURSEG_TYPE - type, META_CP, true);
-
+#ifdef CONFIG_F2FS_MULTI_LOG
+	for (; type <= CURSEG_COLD_NODE; type++) {
+		logs = __get_number_active_logs_for_type(sbi, type);
+		for(j = 0; j < logs; j++){
+			err = read_normal_summaries(sbi, type, j);
+			if (err)
+				return err;
+		}
+	}
+#else
 	for (; type <= CURSEG_COLD_NODE; type++) {
 		err = read_normal_summaries(sbi, type);
 		if (err)
 			return err;
 	}
+#endif
 
 	/* sanity check for summary blocks */
 	if (nats_in_cursum(nat_j) > NAT_JOURNAL_ENTRIES ||
@@ -3676,13 +4335,25 @@ static void write_normal_summaries(struct f2fs_sb_info *sbi,
 					block_t blkaddr, int type)
 {
 	int i, end;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int logs, j;
+#endif
 	if (IS_DATASEG(type))
 		end = type + NR_CURSEG_DATA_TYPE;
 	else
 		end = type + NR_CURSEG_NODE_TYPE;
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+	for(i = type; i < end; i++){
+		logs = __get_number_active_logs_for_type(sbi, i - type);
+
+		for(j = 0; j < logs;j++)
+			write_current_sum_page_at_log(sbi, i, blkaddr + (i - type), j);
+	}
+#else
 	for (i = type; i < end; i++)
 		write_current_sum_page(sbi, i, blkaddr + (i - type));
+#endif
 }
 
 void f2fs_write_data_summaries(struct f2fs_sb_info *sbi, block_t start_blk)
@@ -4096,14 +4767,49 @@ static int build_curseg(struct f2fs_sb_info *sbi)
 {
 	struct curseg_info *array;
 	int i;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	unsigned int log;
 
+	array = f2fs_kzalloc(sbi, array_size(NR_CURSEG_TYPE * MAX_ACTIVE_LOGS, sizeof(*array)),
+			     GFP_KERNEL);
+#else
 	array = f2fs_kzalloc(sbi, array_size(NR_CURSEG_TYPE, sizeof(*array)),
 			     GFP_KERNEL);
+#endif
+
 	if (!array)
 		return -ENOMEM;
 
 	SM_I(sbi)->curseg_array = array;
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+	/* Init all of the curseg_array, since we do not know how many
+     * we end up using. Therefore, stream info is only intialized
+     * for the default 1 stream per type (hot/warm/cold for data/node)
+     */
+	for (i = 0; i < NR_CURSEG_TYPE * MAX_ACTIVE_LOGS; i++) {
+		mutex_init(&array[i].curseg_mutex);
+		array[i].sum_blk = f2fs_kzalloc(sbi, PAGE_SIZE, GFP_KERNEL);
+		if (!array[i].sum_blk)
+			return -ENOMEM;
+		init_rwsem(&array[i].journal_rwsem);
+		array[i].journal = f2fs_kzalloc(sbi,
+				sizeof(struct f2fs_journal), GFP_KERNEL);
+		if (!array[i].journal)
+			return -ENOMEM;
+		array[i].segno = NULL_SEGNO;
+		array[i].next_blkoff = 0;
+		if (i < NO_CHECK_TYPE)
+        {
+            /* The first stram initialization should always succeed because 
+             * maximum number of streams is at least 6, hence allows for 
+             * at least one stream allocated for each type
+             */
+            if (!__test_and_set_inuse_new_log(sbi, i, &log) && log != 0)
+                f2fs_err(sbi, "Failed initializing stream 0 for type: %u", i);
+        }
+	}
+#else
 	for (i = 0; i < NR_CURSEG_TYPE; i++) {
 		mutex_init(&array[i].curseg_mutex);
 		array[i].sum_blk = f2fs_kzalloc(sbi, PAGE_SIZE, GFP_KERNEL);
@@ -4117,8 +4823,54 @@ static int build_curseg(struct f2fs_sb_info *sbi)
 		array[i].segno = NULL_SEGNO;
 		array[i].next_blkoff = 0;
 	}
+#endif
 	return restore_curseg_summaries(sbi);
 }
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int __init_curseg_log(struct f2fs_sb_info *sbi, unsigned int type, 
+        unsigned int log)
+{
+	struct sit_info *sit_i = SIT_I(sbi);
+	struct curseg_info *curseg;
+
+	curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+
+	down_read(&SM_I(sbi)->curseg_lock);
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&sit_i->sentry_lock);
+
+	unsigned int old_segno = curseg->segno;
+	sit_i->s_ops->allocate_segment(sbi, type, true, log);
+	locate_dirty_segment(sbi, old_segno);
+
+	__init_sit_entry_log(sbi, curseg->segno, log);
+
+	__set_test_and_inuse(sbi, curseg->segno);
+
+	up_write(&sit_i->sentry_lock);
+	mutex_unlock(&curseg->curseg_mutex);
+	up_read(&SM_I(sbi)->curseg_lock);
+
+	return 0;
+}
+
+int build_curseg_logs(struct f2fs_sb_info *sbi)
+{
+    int i, err;
+    unsigned int log;
+
+    for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_NODE; i++) {
+        while (__test_and_set_inuse_new_log(sbi, i, &log)) {
+            err = __init_curseg_log(sbi, i, log);
+            if (err)
+                return err;
+        }
+    }    
+
+    return 0;
+}
+#endif
 
 static int build_sit_entries(struct f2fs_sb_info *sbi)
 {
@@ -4317,6 +5069,43 @@ static int build_dirty_segmap(struct f2fs_sb_info *sbi)
 	return init_victim_secmap(sbi);
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int sanity_check_curseg(struct f2fs_sb_info *sbi)
+{
+	int i, j;
+	unsigned int logs;
+	/*
+	 * In LFS/SSR curseg, .next_blkoff should point to an unused blkaddr;
+	 * In LFS curseg, all blkaddr after .next_blkoff should be unused.
+	 */
+	for (i = 0; i < NO_CHECK_TYPE; i++) {
+		logs = __get_number_active_logs_for_type(sbi, i);
+		for( j = 0; j < logs; j++){
+			struct curseg_info *curseg = CURSEG_I(sbi, j * NR_CURSEG_TYPE + i);
+			struct seg_entry *se = get_seg_entry(sbi, curseg->segno);
+			unsigned int blkofs = curseg->next_blkoff;
+
+			if (f2fs_test_bit(blkofs, se->cur_valid_map))
+				goto out;
+
+			if (curseg->alloc_type == SSR)
+				continue;
+
+			for (blkofs += 1; blkofs < sbi->blocks_per_seg; blkofs++) {
+				if (!f2fs_test_bit(blkofs, se->cur_valid_map))
+					continue;
+	out:
+				f2fs_err(sbi,
+					"Current segment's next free block offset is inconsistent with bitmap, logtype:%u, segno:%u, type:%u, next_blkoff:%u, blkofs:%u",
+					i, curseg->segno, curseg->alloc_type,
+					curseg->next_blkoff, blkofs);
+				return -EFSCORRUPTED;
+			}
+		}
+	}
+	return 0;
+}
+#else
 static int sanity_check_curseg(struct f2fs_sb_info *sbi)
 {
 	int i;
@@ -4349,6 +5138,7 @@ out:
 	}
 	return 0;
 }
+#endif
 
 /*
  * Update min, max modified time for cost-benefit GC algorithm

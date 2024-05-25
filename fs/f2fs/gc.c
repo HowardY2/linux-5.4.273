@@ -775,6 +775,9 @@ static int move_data_block(struct inode *inode, block_t bidx,
 		.encrypted_page = NULL,
 		.in_list = false,
 		.retry = false,
+#ifdef CONFIG_F2FS_MULTI_LOG
+		.log = 0,
+#endif
 	};
 	struct dnode_of_data dn;
 	struct f2fs_summary sum;
@@ -783,6 +786,12 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	block_t newaddr;
 	int err = 0;
 	bool lfs_mode = test_opt(fio.sbi, LFS);
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+	unsigned int log;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+    bool dirtied = false;
+#endif
 
 	/* do not read out */
 	page = f2fs_grab_cache_page(inode->i_mapping, bidx, false);
@@ -862,8 +871,40 @@ static int move_data_block(struct inode *inode, block_t bidx,
 		}
 	}
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+	/* If a file is GCed and is holding an exclusive log, it must be released.
+     * Since GC moves data to COLD, this avoids locking exclusive logs
+     * if the data is no longer of the same type. 
+     */
+    if (F2FS_OPTION(fio.sbi).log_alloc_policy == LOG_ALLOC_SRR) {
+        spin_lock(&fi->i_logs_lock);
+        if (fi->i_has_exclusive_data_log) {
+            __release_exclusive_data_log(fio.sbi, inode);
+            dirtied = true;
+        }
+        spin_unlock(&fi->i_logs_lock);
+        if (dirtied)
+            f2fs_mark_inode_dirty_sync(inode, true);
+    } else if (F2FS_OPTION(fio.sbi).log_alloc_policy == LOG_ALLOC_AMFS) {
+        /* Need to reset the logs bitmap in the inode, if set, since data
+         * can move to new type (e.g., HOT to COLD after GC) */
+        spin_lock(&fi->i_logs_lock);
+        if (inode->i_has_logmap && fi->i_has_logmap) {
+            fi->i_has_logmap = false;
+            dirtied = true;
+        }
+        spin_unlock(&fi->i_logs_lock);
+        if (dirtied)
+            f2fs_mark_inode_dirty_sync(inode, true);
+    }
+
+    f2fs_allocate_data_block(fio.sbi, NULL, fio.old_blkaddr, &newaddr,
+					&sum, CURSEG_COLD_DATA, NULL, false, &log);
+    fio.log = log;
+#else
 	f2fs_allocate_data_block(fio.sbi, NULL, fio.old_blkaddr, &newaddr,
 					&sum, CURSEG_COLD_DATA, NULL, false);
+#endif
 
 	fio.encrypted_page = f2fs_pagecache_get_page(META_MAPPING(fio.sbi),
 				newaddr, FGP_LOCK | FGP_CREAT, GFP_NOFS);
@@ -1422,8 +1463,12 @@ static int free_segment_range(struct f2fs_sb_info *sbi, unsigned int start,
 
 	/* Move out cursegs from the target range */
 	for (type = CURSEG_HOT_DATA; type < NR_CURSEG_TYPE; type++)
+#ifdef CONFIG_F2FS_MULTI_LOG
+		/* Currently GC segment allocations are pinned to stream 0 */
+		allocate_segment_for_resize(sbi, type, start, end, 0);
+#else
 		allocate_segment_for_resize(sbi, type, start, end);
-
+#endif
 	/* do GC to move out valid blocks in the range */
 	for (segno = start; segno <= end; segno += sbi->segs_per_sec) {
 		struct gc_inode_list gc_list = {

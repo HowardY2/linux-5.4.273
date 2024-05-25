@@ -37,6 +37,8 @@
 
 static struct kmem_cache *f2fs_inode_cachep;
 
+// #define CONFIG_F2FS_MULTI_LOG
+
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 
 const char *f2fs_fault_name[FAULT_MAX] = {
@@ -95,6 +97,12 @@ enum {
 	Opt_acl,
 	Opt_noacl,
 	Opt_active_logs,
+	Opt_logs,
+    Opt_hot_data_logs,
+    Opt_warm_data_logs,
+    Opt_cold_data_logs,
+    Opt_rr_stride,
+    Opt_log_policy,
 	Opt_disable_ext_identify,
 	Opt_inline_xattr,
 	Opt_noinline_xattr,
@@ -157,6 +165,12 @@ static match_table_t f2fs_tokens = {
 	{Opt_acl, "acl"},
 	{Opt_noacl, "noacl"},
 	{Opt_active_logs, "active_logs=%u"},
+	{Opt_logs, "logs=%u"},
+	{Opt_hot_data_logs, "hot_data_logs=%u"},
+	{Opt_warm_data_logs, "warm_data_logs=%u"},
+	{Opt_cold_data_logs, "cold_data_logs=%u"},
+    {Opt_rr_stride, "rr_stride=%u"},
+    {Opt_log_policy, "log_policy=%s"},
 	{Opt_disable_ext_identify, "disable_ext_identify"},
 	{Opt_inline_xattr, "inline_xattr"},
 	{Opt_noinline_xattr, "noinline_xattr"},
@@ -566,10 +580,115 @@ static int parse_options(struct super_block *sb, char *options)
 		case Opt_active_logs:
 			if (args->from && match_int(args, &arg))
 				return -EINVAL;
+#ifdef CONFIG_F2FS_MULTI_LOG
+            f2fs_info(sbi, "active_logs not supported");
+            break;
+        case Opt_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+            if (arg > MAX_ACTIVE_LOGS || arg < NR_CURSEG_TYPE)
+            {
+                f2fs_info(sbi, "Invalid Streams: %u must be at least 6 up to 16", arg);
+                return -EINVAL;
+            }
+            if (F2FS_OPTION(sbi).set_arg_per_log_max)
+            {
+                f2fs_info(sbi, "streams option and per type streams are mutually exclusive."
+                        " Either set streams= or per type maximums.");
+                return -EINVAL;
+
+            }
+            f2fs_info(sbi, "CURRENTLY NOT SUPPORTED");
+            return -EINVAL;
+            /* F2FS_OPTION(sbi).arg_nr_max_logs = arg; */
+            /* F2FS_OPTION(sbi).set_arg_nr_max_logs = true; */
+            break;
+        case Opt_hot_data_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+            if (F2FS_OPTION(sbi).set_arg_nr_max_logs)
+            {
+                f2fs_info(sbi, "streams option and per type streams are mutually exclusive."
+                        " Either set streams= or per type maximums.");
+                return -EINVAL;
+
+            }
+            F2FS_OPTION(sbi).arg_nr_max_logs += arg - 1; /* 1 stream by default */
+            if (F2FS_OPTION(sbi).arg_nr_max_logs > MAX_ACTIVE_LOGS)
+            {
+                f2fs_err(sbi, "Invalid data streams: cannot be more than 16 in total");
+                return -EINVAL;
+            }
+            F2FS_OPTION(sbi).nr_logs[CURSEG_HOT_DATA] = arg;
+            F2FS_OPTION(sbi).set_arg_per_log_max = true;
+            break;
+        case Opt_warm_data_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+            if (F2FS_OPTION(sbi).set_arg_nr_max_logs)
+            {
+                f2fs_info(sbi, "streams option and per type streams are mutually exclusive."
+                        " Either set streams= or per type maximums.");
+                return -EINVAL;
+
+            }
+            F2FS_OPTION(sbi).arg_nr_max_logs += arg - 1;
+            if (F2FS_OPTION(sbi).arg_nr_max_logs > MAX_ACTIVE_LOGS)
+            {
+                f2fs_err(sbi, "Invalid data streams: cannot be more than 16 in total");
+                return -EINVAL;
+            }
+            F2FS_OPTION(sbi).nr_logs[CURSEG_WARM_DATA] = arg;
+            F2FS_OPTION(sbi).set_arg_per_log_max = true;
+            break;
+        case Opt_cold_data_logs:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+            if (F2FS_OPTION(sbi).set_arg_nr_max_logs)
+            {
+                f2fs_info(sbi, "streams option and per type streams are mutually exclusive."
+                        " Either set streams= or per type maximums.");
+                return -EINVAL;
+
+            }
+            F2FS_OPTION(sbi).arg_nr_max_logs += arg - 1;
+            if (F2FS_OPTION(sbi).arg_nr_max_logs > MAX_ACTIVE_LOGS)
+            {
+                f2fs_err(sbi, "Invalid data streams: cannot be more than 16 in total");
+                return -EINVAL;
+            }
+            F2FS_OPTION(sbi).nr_logs[CURSEG_COLD_DATA] = arg;
+            F2FS_OPTION(sbi).set_arg_per_log_max = true;
+            break;
+        case Opt_rr_stride:
+			if (args->from && match_int(args, &arg))
+				return -EINVAL;
+            F2FS_OPTION(sbi).rr_stride = arg;
+            break;
+        case Opt_log_policy:
+			name = match_strdup(&args[0]);
+
+			if (!name)
+				return -ENOMEM;
+			if (!strcmp(name, "srr")) {
+				F2FS_OPTION(sbi).log_alloc_policy = LOG_ALLOC_SRR;
+			} else if (!strcmp(name, "spf")) {
+				F2FS_OPTION(sbi).log_alloc_policy = LOG_ALLOC_SPF;
+			} else if (!strcmp(name, "amfs")) {
+				F2FS_OPTION(sbi).log_alloc_policy = LOG_ALLOC_AMFS;
+			} else {
+				kfree(name);
+                f2fs_err(sbi, "Invalid stream allocation policy");
+				return -EINVAL;
+			}
+			kfree(name);
+			break;
+#else
 			if (arg != 2 && arg != 4 && arg != NR_CURSEG_TYPE)
 				return -EINVAL;
 			F2FS_OPTION(sbi).active_logs = arg;
 			break;
+#endif
 		case Opt_disable_ext_identify:
 			set_opt(sbi, DISABLE_EXT_IDENTIFY);
 			break;
@@ -953,6 +1072,10 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	init_rwsem(&fi->i_gc_rwsem[WRITE]);
 	init_rwsem(&fi->i_mmap_sem);
 	init_rwsem(&fi->i_xattr_sem);
+#ifdef CONFIG_F2FS_MULTI_LOG
+	spin_lock_init(&fi->i_logs_lock);
+#endif
+	
 
 	/* Will be used by directory only */
 	fi->i_dir_level = F2FS_SB(sb)->dir_level;
@@ -1108,6 +1231,21 @@ static void destroy_device_list(struct f2fs_sb_info *sbi)
 	}
 	kvfree(sbi->devs);
 }
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static void f2fs_destroy_multi_log_info(struct f2fs_sb_info *sbi)
+{
+	int i;
+
+	for (i = 0; i < NR_CURSEG_TYPE; i++) {
+		kvfree(sbi->logmap[i]);
+		kvfree(sbi->resmap[i]);
+    }
+
+	kvfree(sbi->logmap);
+	kvfree(sbi->resmap);
+}
+#endif
 
 static void f2fs_put_super(struct super_block *sb)
 {
@@ -1459,6 +1597,19 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	else if (test_opt(sbi, LFS))
 		seq_puts(seq, "lfs");
 	seq_printf(seq, ",active_logs=%u", F2FS_OPTION(sbi).active_logs);
+#ifdef CONFIG_F2FS_MULTI_LOG
+	seq_printf(seq, ",logs=%u", F2FS_OPTION(sbi).nr_max_logs);
+	seq_printf(seq, ",hot_data_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_HOT_DATA]);
+	seq_printf(seq, ",warm_data_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_WARM_DATA]);
+	seq_printf(seq, ",cold_data_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_COLD_DATA]);
+	seq_printf(seq, ",hot_node_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_HOT_NODE]);
+	seq_printf(seq, ",warm_node_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_WARM_NODE]);
+	seq_printf(seq, ",cold_node_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_COLD_NODE]);
+    if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SRR)
+        seq_printf(seq, ",log_alloc=%s", "ssr");
+    else
+        seq_printf(seq, ",log_alloc=%s", "spf");
+#endif
 	if (test_opt(sbi, RESERVE_ROOT))
 		seq_printf(seq, ",reserve_root=%u,resuid=%u,resgid=%u",
 				F2FS_OPTION(sbi).root_reserved_blocks,
@@ -1514,10 +1665,80 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	return 0;
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static int f2fs_init_multi_log_info(struct f2fs_sb_info *sbi)
+{
+    int i;
+
+    sbi->logmap = f2fs_kvzalloc(sbi, NR_CURSEG_TYPE * sizeof(unsigned long), 
+            GFP_KERNEL);
+
+	if (!sbi->logmap)
+		return -ENOMEM;
+
+    sbi->resmap = f2fs_kvzalloc(sbi, NR_CURSEG_TYPE * sizeof(unsigned long), 
+            GFP_KERNEL);
+
+	if (!sbi->resmap)
+		return -ENOMEM;
+
+	for (i = 0; i < NR_CURSEG_TYPE; i++) {
+		sbi->logmap[i] = f2fs_kvzalloc(sbi, f2fs_bitmap_size(MAX_ACTIVE_LOGS),
+                GFP_KERNEL);
+		if (!sbi->logmap[i])
+			return -ENOMEM;
+		sbi->resmap[i] = f2fs_kvzalloc(sbi, f2fs_bitmap_size(MAX_ACTIVE_LOGS),
+                GFP_KERNEL);
+		if (!sbi->resmap[i])
+			return -ENOMEM;
+	}
+
+    spin_lock_init(&sbi->logmap_lock);
+	spin_lock(&sbi->logmap_lock);
+    atomic_set(&sbi->nr_active_logs, 0);
+	spin_unlock(&sbi->logmap_lock);
+
+    spin_lock_init(&sbi->resmap_lock);
+
+    if (F2FS_OPTION(sbi).set_arg_nr_max_logs || F2FS_OPTION(sbi).set_arg_per_log_max) {
+        sbi->nr_max_logs = F2FS_OPTION(sbi).arg_nr_max_logs;
+    } else {
+        sbi->nr_max_logs = NR_CURSEG_TYPE;
+    }
+
+    if (F2FS_OPTION(sbi).set_arg_nr_max_logs) {
+        for (i = 0; i <= CURSEG_COLD_NODE; i++) 
+            F2FS_OPTION(sbi).nr_logs[i] = F2FS_OPTION(sbi).nr_max_logs - CURSEG_COLD_NODE; 
+    } 
+
+    for (i = 0; i <= CURSEG_COLD_NODE; i++) {
+        atomic_set(&sbi->rr_active_log[i], MAX_ACTIVE_LOGS);
+        atomic_set(&sbi->rr_stride_ctr[i], 0);
+        spin_lock_init(&sbi->rr_active_log_lock[i]);
+    }
+
+    return 0;
+}
+#endif
+
 static void default_options(struct f2fs_sb_info *sbi)
 {
 	/* init some FS parameters */
 	F2FS_OPTION(sbi).active_logs = NR_CURSEG_TYPE;
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int i;
+	F2FS_OPTION(sbi).log_alloc_policy = LOG_ALLOC_SPF;
+    F2FS_OPTION(sbi).nr_max_logs = NR_CURSEG_TYPE;
+    F2FS_OPTION(sbi).arg_nr_max_logs = 6; /* default 1 stream */
+    F2FS_OPTION(sbi).set_arg_nr_max_logs = false;
+    F2FS_OPTION(sbi).set_arg_per_log_max = false;
+    F2FS_OPTION(sbi).rr_stride = 1;
+
+    for (i = 0; i <= CURSEG_COLD_NODE; i++)
+       F2FS_OPTION(sbi).nr_logs[i] = 1; 
+#endif
+
 	F2FS_OPTION(sbi).inline_xattr_size = DEFAULT_INLINE_XATTR_ADDRS;
 	F2FS_OPTION(sbi).whint_mode = WHINT_MODE_OFF;
 	F2FS_OPTION(sbi).alloc_mode = ALLOC_MODE_DEFAULT;
@@ -3253,6 +3474,9 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 	int recovery, i, valid_super_block;
 	struct curseg_info *seg_i;
 	int retry_cnt = 1;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int j;
+#endif
 
 try_onemore:
 	err = -EINVAL;
@@ -3401,6 +3625,12 @@ try_onemore:
 	init_rwsem(&sbi->quota_sem);
 	init_waitqueue_head(&sbi->cp_wait);
 	init_sb_info(sbi);
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+    err = f2fs_init_multi_log_info(sbi);
+    if (err)
+        goto free_multi_log;
+#endif
 
 	err = init_percpu_info(sbi);
 	if (err)
@@ -3596,6 +3826,18 @@ try_onemore:
 			goto free_meta;
 		}
 	}
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+    if (F2FS_OPTION(sbi).set_arg_per_log_max) {
+        /* We currently don't have checkpoints implemented, therefore
+         * treat new streas as if we were allocating new segmennts
+         */
+        err = build_curseg_logs(sbi);
+        if (err)
+            return err;
+    }
+#endif
+
 reset_checkpoint:
 	/* f2fs_recover_fsync_data() cleared this already */
 	clear_sbi_flag(sbi, SBI_POR_DOING);
@@ -3659,6 +3901,10 @@ free_meta:
 	/* evict some inodes being cached by GC */
 	evict_inodes(sb);
 	f2fs_unregister_sysfs(sbi);
+#ifdef CONFIG_F2FS_MULTI_LOG
+free_multi_log:
+    f2fs_destroy_multi_log_info(sbi);
+#endif
 free_root_inode:
 	dput(sb->s_root);
 	sb->s_root = NULL;

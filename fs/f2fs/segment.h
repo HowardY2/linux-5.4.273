@@ -8,6 +8,8 @@
 #include <linux/blkdev.h>
 #include <linux/backing-dev.h>
 
+
+
 /* constant macro */
 #define NULL_SEGNO			((unsigned int)(~0))
 #define NULL_SECNO			((unsigned int)(~0))
@@ -28,6 +30,9 @@
 #define IS_WARM(t)	((t) == CURSEG_WARM_NODE || (t) == CURSEG_WARM_DATA)
 #define IS_COLD(t)	((t) == CURSEG_COLD_NODE || (t) == CURSEG_COLD_DATA)
 
+// #define CONFIG_F2FS_MULTI_LOG
+
+#ifndef CONFIG_F2FS_MULTI_LOG
 #define IS_CURSEG(sbi, seg)						\
 	(((seg) == CURSEG_I(sbi, CURSEG_HOT_DATA)->segno) ||	\
 	 ((seg) == CURSEG_I(sbi, CURSEG_WARM_DATA)->segno) ||	\
@@ -48,7 +53,8 @@
 	 ((secno) == CURSEG_I(sbi, CURSEG_WARM_NODE)->segno /		\
 	  (sbi)->segs_per_sec) ||	\
 	 ((secno) == CURSEG_I(sbi, CURSEG_COLD_NODE)->segno /		\
-	  (sbi)->segs_per_sec))	\
+	  (sbi)->segs_per_sec))	
+#endif
 
 #define MAIN_BLKADDR(sbi)						\
 	(SM_I(sbi) ? SM_I(sbi)->main_blkaddr : 				\
@@ -183,6 +189,9 @@ struct seg_entry {
 #ifdef CONFIG_F2FS_CHECK_FS
 	unsigned char *cur_valid_map_mir;	/* mirror of current valid bitmap */
 #endif
+#ifdef CONFIG_F2FS_MULTI_LOG
+    unsigned int log; /* log id of the segment */
+#endif
 	/*
 	 * # of valid blocks and the validity bitmap stored in the the last
 	 * checkpoint pack. This information is used by the SSR mode.
@@ -197,7 +206,11 @@ struct sec_entry {
 };
 
 struct segment_allocation {
+#ifdef CONFIG_F2FS_MULTI_LOG
+	void (*allocate_segment)(struct f2fs_sb_info *, int, bool, unsigned int);
+#else
 	void (*allocate_segment)(struct f2fs_sb_info *, int, bool);
+#endif
 };
 
 /*
@@ -300,6 +313,9 @@ struct curseg_info {
 	unsigned short next_blkoff;		/* next block offset to write */
 	unsigned int zone;			/* current zone number */
 	unsigned int next_segno;		/* preallocated segment */
+#ifdef CONFIG_F2FS_MULTI_LOG
+    unsigned int log; /* log id the segment is in */
+#endif
 };
 
 struct sit_entry_set {
@@ -315,6 +331,61 @@ static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 {
 	return (struct curseg_info *)(SM_I(sbi)->curseg_array + type);
 }
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline unsigned int __get_number_active_logs(struct f2fs_sb_info *sbi)
+{
+    unsigned int logs = 0;
+
+    /* active logs won't ever change after initalization, only readers */
+    logs = atomic_read(&sbi->nr_active_logs);
+    
+    return logs;
+}
+
+static inline bool __test_inuse_log(struct f2fs_sb_info *sbi,
+        unsigned int type, unsigned int log)
+{
+    bool is_bit_set = false;
+
+	is_bit_set = test_bit_le(log, sbi->logmap[type]);
+
+    return is_bit_set;
+}
+
+static inline int IS_CURSEG(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+    int log, type;
+    int active_logs = __get_number_active_logs(sbi);
+
+    for (log = 0; log < active_logs; log++) {
+        for (type = 0; type < NR_CURSEG_TYPE; type++) {
+            if (__test_inuse_log(sbi, type, log) && 
+                    segno == (CURSEG_I(sbi, log * NR_CURSEG_TYPE + type)->segno)) 
+                return 1;
+        }
+    }
+
+    return 0;
+}
+
+static inline int IS_CURSEC(struct f2fs_sb_info *sbi, unsigned int secno)
+{
+    int log, type;
+    int active_logs = __get_number_active_logs(sbi);
+
+    for (log = 0; log < active_logs; log++) {
+        for (type = 0; type < NR_CURSEG_TYPE; type++) {
+            if (__test_inuse_log(sbi, type, log) && secno == (CURSEG_I(sbi, log * NR_CURSEG_TYPE + type)->segno / 
+                        sbi->segs_per_sec)) 
+                return 1;
+        }
+    }
+
+    return 0;
+}
+#endif
+
 
 static inline struct seg_entry *get_seg_entry(struct f2fs_sb_info *sbi,
 						unsigned int segno)
@@ -400,6 +471,555 @@ static inline void seg_info_to_raw_sit(struct seg_entry *se,
 	memcpy(se->ckpt_valid_map, rs->valid_map, SIT_VBLOCK_MAP_SIZE);
 	se->ckpt_valid_blocks = se->valid_blocks;
 }
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline bool __test_and_set_inuse_new_log(struct f2fs_sb_info *sbi,
+        unsigned int type, unsigned int *log)
+{
+    bool new_log = true;
+    unsigned int logs = 0;
+
+	spin_lock(&sbi->logmap_lock);
+
+    if (F2FS_OPTION(sbi).set_arg_nr_max_logs) {
+        if (atomic_read(&sbi->nr_active_logs) < sbi->nr_max_logs) {
+            *log = find_first_zero_bit_le(sbi->logmap[type], MAX_ACTIVE_LOGS);
+            set_bit_le(*log, sbi->logmap[type]);
+            atomic_inc(&sbi->nr_active_logs);
+        } else {
+            new_log = false;
+        }
+    } else {
+        logs = find_next_zero_bit_le(sbi->logmap[type], MAX_ACTIVE_LOGS, 0);
+        if (logs < F2FS_OPTION(sbi).nr_logs[type]) {
+            *log = find_first_zero_bit_le(sbi->logmap[type], MAX_ACTIVE_LOGS);
+            set_bit_le(*log, sbi->logmap[type]);
+            atomic_inc(&sbi->nr_active_logs);
+        } else {
+            new_log = false;
+        }
+    } 
+
+    spin_unlock(&sbi->logmap_lock);
+
+    return new_log;
+}
+
+static inline unsigned int __get_number_active_logs_for_type(struct f2fs_sb_info *sbi,
+        unsigned int type)
+{
+    unsigned int logs = 0;
+
+    logs = find_next_zero_bit_le(sbi->logmap[type], MAX_ACTIVE_LOGS, 0);
+
+    return logs;
+}
+
+/* 
+ * Increases the stride counter and returns true if the stride has reached the configured
+ * value, thus allowing to start writing at the next log 
+ * 
+ * Function assumes the spinlock_t on rr_active_log_lock is held by the calling
+ * function.
+ */
+static inline bool __test_and_update_rr_stride(struct f2fs_sb_info *sbi, unsigned int type)
+{
+   unsigned int rr_stride = 0; 
+
+   rr_stride = atomic_read(&sbi->rr_stride_ctr[type]);
+
+   if (rr_stride == F2FS_OPTION(sbi).rr_stride) {
+        /* reset counter for current log */
+        atomic_set(&sbi->rr_stride_ctr[type], 0);
+        /* increment counter for new write on next log */
+        atomic_inc(&sbi->rr_stride_ctr[type]);
+
+        return true;
+   } else {
+        atomic_inc(&sbi->rr_stride_ctr[type]);
+
+        return false;
+   }
+}
+
+static inline unsigned int __get_current_log_and_set_next_log_active(struct f2fs_sb_info *sbi,
+        unsigned int type)
+{
+    unsigned int log = 0;
+    bool next_log = false;
+
+	spin_lock(&sbi->rr_active_log_lock[type]);
+    log = atomic_read(&sbi->rr_active_log[type]);
+
+    /* first init */
+    if (log == MAX_ACTIVE_LOGS)
+        goto first_init;
+
+    /* Only a single log, no need for doing RR */
+    if (F2FS_OPTION(sbi).nr_logs[type] == 1) 
+        goto unchanged;
+
+    next_log = __test_and_update_rr_stride(sbi, type);
+    if (next_log && log == F2FS_OPTION(sbi).nr_logs[type] - 1) {
+first_init:
+        atomic_set(&sbi->rr_active_log[type], 0);
+        log = 0;
+    } else if (next_log) {
+        atomic_inc(&sbi->rr_active_log[type]);
+        log++;
+    }
+
+unchanged:
+	spin_unlock(&sbi->rr_active_log_lock[type]);
+
+    return log;
+}
+
+static inline bool __test_log_reserved(struct f2fs_sb_info *sbi, unsigned int type,
+        unsigned int log)
+{
+    bool is_bit_set = false;
+
+	spin_lock(&sbi->resmap_lock);
+	is_bit_set = test_bit_le(log, sbi->resmap[type]);
+	spin_unlock(&sbi->resmap_lock);
+
+    return is_bit_set;
+}
+
+static inline unsigned int __get_next_file_log_rr(struct f2fs_sb_info *sbi, 
+        unsigned int type)
+{
+    unsigned int log = 0;
+
+	spin_lock(&sbi->rr_active_log_lock[type]);
+
+    do {
+        log = atomic_read(&sbi->rr_active_log[type]);
+
+        /* first allocation for a log */
+        if (log == MAX_ACTIVE_LOGS) {
+            atomic_set(&sbi->rr_active_log[type], 0);
+            log = 0;
+            continue;
+        }
+
+        if (log == F2FS_OPTION(sbi).nr_logs[type] - 1) {
+            atomic_set(&sbi->rr_active_log[type], 0);
+            log = 0;
+        } else {
+            log = atomic_inc_return(&sbi->rr_active_log[type]);
+        }
+    } while (__test_log_reserved(sbi, type, log));
+
+    spin_unlock(&sbi->rr_active_log_lock[type]);
+
+    return log;
+}
+
+/* sets and returns a file log for an inode based on SPF policy.
+ * Assumes the caller is holding the spinlock i_logs_lock for the inode.
+ *
+ * Note, this function modifies the inode in all cases, therefore after releasing 
+ * the spinlock i_logs_lock in the calling function, 
+ * f2fs_mark_inode_dirty_sync(inode, true) should be called 
+ */
+static inline unsigned int __set_and_return_file_data_log(struct f2fs_sb_info *sbi,
+        unsigned int type, struct inode *inode)
+{
+    unsigned int log = 0;
+    unsigned int active_logs = __get_number_active_logs_for_type(sbi, type);
+    unsigned int next_free_log;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+
+    if (inode->i_exclusive_data_log) {
+        /* only have a single log, no exclusive reservation or RR allocation needed */
+        if (active_logs == 1)
+            goto fail_set_exclusive;
+
+        spin_lock(&sbi->resmap_lock);
+
+        /* Log 0 is a special log, non-reservable by files for exclusive access */
+        next_free_log = find_next_zero_bit_le(sbi->resmap[type], MAX_ACTIVE_LOGS, 1);
+
+        /* we always need to keep at least 1 non-exclusive log for data (log 0), therefore
+         * fail exclusive log allocation if all other logs are reserved */
+        if (next_free_log == active_logs) {
+            /* need to release lock because call to __get_next_file_log_rr may also attempt lock */
+            spin_unlock(&sbi->resmap_lock);
+
+            /* fall back to RR based file log allocation */
+            log = __get_next_file_log_rr(sbi, type);
+            goto fail_set_exclusive;
+        } else {
+            log = next_free_log;
+            set_bit_le(log, sbi->resmap[type]);
+            sbi->logs_inomap[log * NR_CURSEG_TYPE + type] = inode->i_ino;
+
+            spin_unlock(&sbi->resmap_lock);
+            fi->i_has_exclusive_data_log = true;
+        }
+    } else {
+        log = __get_next_file_log_rr(sbi, type);
+    }
+
+set_log:
+    fi->i_data_log = log;
+    fi->i_has_pinned_data_log = true;
+
+    return log;
+
+fail_set_exclusive:
+    /* Failing resets the inode flag and prints a kernel info message */
+    f2fs_info(sbi, "Failed setting exclusive log for inode %lu. No free exclusive logs available.", inode->i_ino);
+    inode->i_exclusive_data_log = false;
+
+    goto set_log;
+}
+
+/*
+ * Sets and returns the node log for a file.
+ * NOTE, we currently do not support mutliple NODE logs, therefore this will always return 0 */
+static inline unsigned int __set_and_return_file_node_log(struct f2fs_sb_info *sbi, unsigned int type,
+        struct inode *inode)
+{
+    unsigned int log = 0;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+
+    log = __get_next_file_log_rr(sbi, type);
+
+    down_write(&fi->i_sem);
+    fi->i_node_log = log;
+    fi->i_has_pinned_node_log = true;
+    up_write(&fi->i_sem);
+
+    return log;
+}
+
+/* Gets a log from the bitmap in the inode. If no bitmap is in the inode, returns log 0.
+ * Otherwise set log is returned if it is an active log. If the log is inactive,
+ * the application provided logmap is reset and log 0 is returned.
+ * If multiple logs are set in the bitmap, RR between the logs and stride that fills a segment,
+ * which aims to decrease fragmentation and get close to MDTS of the used ZNS device. Therefore,
+ * once a segment in a log is fully written RR goes to the next log.
+ *
+ * Note, function assumes the caller is holding i_logs_lock.
+ */
+static inline unsigned int __get_log_from_inode_logmap(struct f2fs_sb_info *sbi,
+        unsigned int type, struct inode *inode)
+{
+    struct curseg_info *curseg;
+    unsigned int log = 0;
+    unsigned int tested = 0;
+    unsigned int segno = 0;
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+    unsigned int active_logs = __get_number_active_logs_for_type(sbi, type);
+
+    /* this init only happens once, the first block written of the inode */
+    if (unlikely(!fi->i_has_logmap_init))
+        fi->i_has_logmap_init = true;
+
+    /* only have a single log, no exclusive reservation or RR allocation needed */
+    if (active_logs == 1)
+        goto fail_logmap;
+    
+get_log:
+    /* RR restart checking logs from log 0 */
+    if (fi->i_last_log == active_logs)
+        fi->i_last_log = 0;
+    log = find_next_bit(&inode->i_logmap, active_logs, fi->i_last_log);
+
+    /* If log is not active, application set bitmap is not valid,
+     * skip this log and check the next one.
+     * At least 1 log bit MUST be set, otherwise fcntl would have
+     * failed and not set it. Avoids this infinitely looping. */
+    if (!__test_inuse_log(sbi, type, log)) {
+        fi->i_last_log = log;
+        tested++;
+
+        /* if inode logmap only contains invalid bits identify when
+         * to fail and fallback to log 0 */
+        if (tested == active_logs) {
+            log = 0;
+            goto fail_logmap;
+        }
+
+        goto get_log;
+    }
+
+    /* passed above checks, enable logmap flag */
+    fi->i_has_logmap = true;
+
+	curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+    segno = curseg->segno;
+
+    if (unlikely(curseg->segno == NULL_SEGNO)) {
+        /* if the log runs out of space, it means the file system
+         * is mostly utilized and we ignore the application hint
+         * and f2fs_allocate_data_block will find the first fit for
+         * the block in a log and assign this. Hence, we still return
+         * the bad log and let caller handle it, which will repeat 
+         * this check */
+        goto got_log;
+    } else {
+        if (fi->i_last_segno == 0 || segno == fi->i_last_segno) {
+            fi->i_last_segno = segno;
+            goto got_log;
+        } else {
+            fi->i_last_log = log + 1; 
+            fi->i_last_segno = 0; /* reset i_last_segno to get new log */
+            goto get_log;
+        }
+    }
+
+got_log:
+    return log;
+
+fail_logmap:
+    /* Failing resets the inode flag and prints a kernel info message */
+    f2fs_info(sbi, "Failed getting valid logmap for inode %lu. Disabling logmap for inode.", inode->i_ino);
+    fi->i_has_logmap = false;
+    log = 0;
+
+    goto got_log;
+}
+
+/* 
+ * Get the log index for an inode and clear it. This function must only
+ * be called during deallocation of an exclusive log.
+ * Assumes the caller holds the sbi->resmap_lock 
+ */
+static inline unsigned int __get_and_clear_log_index_from_inode(struct f2fs_sb_info *sbi,
+        unsigned long ino, unsigned int *log)
+{
+    unsigned int type;
+    unsigned int active_logs;
+
+    for (type = CURSEG_HOT_DATA; type < NO_CHECK_TYPE; type++) {
+        active_logs = __get_number_active_logs_for_type(sbi, type);
+        for (*log = 0; *log < active_logs; (*log)++) {
+            if (sbi->logs_inomap[*log * NR_CURSEG_TYPE + type] == ino) {
+                sbi->logs_inomap[*log * NR_CURSEG_TYPE + type] = 0;
+                return type;
+            }
+        }
+    }
+
+    /* Should never get here */
+    return -EINVAL;
+}
+
+static inline unsigned int __test_ino_holds_exclusive_log(struct f2fs_sb_info *sbi,
+        unsigned long ino)
+{
+    unsigned int i, j;
+    unsigned int active_logs;
+
+    for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
+        active_logs = __get_number_active_logs_for_type(sbi, i);
+        for (j = 0; j < active_logs; j++) {
+            if (sbi->logs_inomap[j * NR_CURSEG_TYPE + i] == ino) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static inline void __release_exclusive_data_log(struct f2fs_sb_info *sbi, 
+        struct inode *inode)
+{
+    struct f2fs_inode_info *fi = F2FS_I(inode);
+    unsigned int log;
+    unsigned int type; 
+
+	spin_lock(&sbi->resmap_lock);
+    type = __get_and_clear_log_index_from_inode(sbi, inode->i_ino, &log);
+	__clear_bit_le(log, sbi->resmap[type]);
+	spin_unlock(&sbi->resmap_lock);
+
+    fi->i_has_exclusive_data_log = false;
+}
+
+/* Different from __release_exclusive_data_log this function is meant for
+ * inodes that are being deleted, hence no need to update any inode flags.
+ */
+static inline void __clear_exclusive_data_log(struct f2fs_sb_info *sbi, 
+        unsigned long ino)
+{
+    unsigned int log;
+    unsigned int type; 
+
+	spin_lock(&sbi->resmap_lock);
+    type = __get_and_clear_log_index_from_inode(sbi, ino, &log);
+	__clear_bit_le(log, sbi->resmap[type]);
+	spin_unlock(&sbi->resmap_lock);
+}
+
+static inline unsigned int __get_number_reserved_logs_for_type(struct f2fs_sb_info *sbi,
+        unsigned int type)
+{
+    unsigned int logs = 0;
+    unsigned int active_logs = __get_number_active_logs_for_type(sbi, type);
+    int i;
+
+	spin_lock(&sbi->resmap_lock);
+    for (i = 0; i < active_logs; i++) {
+        if (test_bit_le(i, sbi->resmap[type]))
+            logs++;
+    }
+	spin_unlock(&sbi->resmap_lock);
+
+    return logs;
+}
+
+static inline unsigned long __get_reserved_log_inode(struct f2fs_sb_info *sbi,
+        unsigned int type, unsigned int log)
+{
+    unsigned long ino;
+
+	spin_lock(&sbi->resmap_lock);
+    ino = sbi->logs_inomap[log * NR_CURSEG_TYPE + type];
+	spin_unlock(&sbi->resmap_lock);
+
+    return ino;
+}
+
+struct f2fs_report_zone_state_args {
+	struct f2fs_dev_info *dev;
+};
+
+// static int check_zone_state(struct f2fs_dev_info *dev, struct blk_zone *zone, 
+//         unsigned int idx)
+// {
+//     switch (zone->cond) {
+//         case BLK_ZONE_COND_IMP_OPEN:
+//         case BLK_ZONE_COND_EXP_OPEN:
+//         case BLK_ZONE_COND_CLOSED:
+//             set_bit(idx, dev->blkz_active);
+//             break;
+//         default:
+//             clear_bit(idx, dev->blkz_active);
+//             break;
+//     } 
+
+//     return 0;
+// }
+
+// static int f2fs_report_zone_state_cb(struct blk_zone *zone, unsigned int idx,
+// 				      void *data)
+// {
+// 	struct f2fs_report_zone_state_args *args;
+
+// 	args = (struct f2fs_report_zone_state_args *)data;
+
+// 	return check_zone_state(args->dev, zone, idx);
+// }
+
+/* Loops over the active zones in the blkz_active bitmap and identifies if these are 
+ * still active on the device, if not the callback function resets that bit.
+ *
+ * Function returns bool identifying if maximum number of active zones are being used. 
+ *
+//  */
+// static inline bool __has_max_active_zones(struct f2fs_sb_info *sbi, unsigned int segno)
+// {
+//     int ret;
+// 	unsigned int dev_idx;
+//     unsigned int active_zones = 0;
+//     unsigned int next_zone = 0;
+//     struct f2fs_report_zone_state_args rep_zone_arg;
+
+//     dev_idx = f2fs_target_device_index(sbi, START_BLOCK(sbi, segno));
+
+//     rep_zone_arg.dev = &FDEV(dev_idx);
+//     ret = blkdev_report_zones(FDEV(dev_idx).bdev, 0, BLK_ALL_ZONES,
+//             f2fs_report_zone_state_cb, &rep_zone_arg);
+
+//     if (ret < 0)
+//         return true; /* something failed - assume cannot allocate new section */
+
+//     spin_lock(&FDEV(dev_idx).blkz_active_lock);
+//     next_zone = find_first_bit(FDEV(dev_idx).blkz_active, FDEV(dev_idx).nr_blkz);
+
+//     do {
+//         if (test_bit(next_zone, FDEV(dev_idx).blkz_active))
+//             active_zones++;
+
+//         next_zone = find_next_bit(FDEV(dev_idx).blkz_active, 
+//                 FDEV(dev_idx).nr_blkz, next_zone + 1);
+//     } while (next_zone != FDEV(dev_idx).nr_blkz);
+
+//     spin_unlock(&FDEV(dev_idx).blkz_active_lock);
+
+//     return active_zones >= FDEV(dev_idx).max_active_zones;
+// }
+
+static inline bool __has_cursec_reached_last_seg(struct f2fs_sb_info *sbi,
+        unsigned int segno)
+{
+	unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
+	unsigned int start_segno = GET_SEG_FROM_SEC(sbi, secno);
+	unsigned int end_segno = start_segno + sbi->segs_per_sec;
+
+	if (__is_large_section(sbi))
+		end_segno = rounddown(end_segno, sbi->segs_per_sec);
+
+	// if (f2fs_sb_has_blkzoned(sbi))
+	// 	end_segno -= sbi->segs_per_sec -
+	// 				f2fs_usable_segs_in_sec(sbi, segno);
+
+    /* next segment is the write end */
+    return end_segno - 1 == segno;
+}
+
+static inline bool __is_curseg_full(struct f2fs_sb_info *sbi,
+        struct curseg_info *curseg)
+{
+	unsigned int left_blocks = sbi->blocks_per_seg -
+			get_seg_entry(sbi, curseg->segno)->ckpt_valid_blocks;
+
+
+    /* current allocation will go into the last block, hence check equal to 1 */
+    return left_blocks == 1; 
+}
+
+
+// static inline bool __can_allocate_new_section(struct f2fs_sb_info *sbi,
+//         struct curseg_info *curseg, unsigned int type, 
+//         unsigned int log)
+// {
+//     if (unlikely(sbi->busy_log[log * NR_CURSEG_TYPE + type])) {
+//         if (__has_max_active_zones(sbi, curseg->segno))
+//             return false;
+//         else {
+//             /* an active zone has become available */
+//             sbi->busy_log[log * NR_CURSEG_TYPE + type] = false;
+//             goto skip_check;
+//         }
+//     }
+
+//     if (likely(!__is_curseg_full(sbi, curseg)))
+//         goto skip_check;
+//     else {
+//         if (likely(!__has_cursec_reached_last_seg(sbi, curseg->segno)))
+//             goto skip_check;
+
+//         /* curseg is allocating the last block in the current section, hence the next allocation
+//          * will have to check if an active zone is available to allocate it.
+//          *
+//          * Note, this will still return true for the last allocation in the block, but sets a flag
+//          * to check for active zones on the next allocation. 
+//          */
+//         sbi->busy_log[log * NR_CURSEG_TYPE + type] = true;
+//     }
+
+// skip_check:
+//     return true;
+// }
+#endif
+
 
 static inline unsigned int find_next_inuse(struct free_segmap_info *free_i,
 		unsigned int max, unsigned int segno)
@@ -644,6 +1264,15 @@ enum {
 	F2FS_IPU_ASYNC,
 };
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline unsigned int curseg_segno_at(struct f2fs_sb_info *sbi,
+		int type, int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	return curseg->segno;
+}
+#endif
+
 static inline unsigned int curseg_segno(struct f2fs_sb_info *sbi,
 		int type)
 {
@@ -651,12 +1280,30 @@ static inline unsigned int curseg_segno(struct f2fs_sb_info *sbi,
 	return curseg->segno;
 }
 
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline unsigned char curseg_alloc_type_at(struct f2fs_sb_info *sbi,
+		int type, int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	return curseg->alloc_type;
+}
+#endif
+
 static inline unsigned char curseg_alloc_type(struct f2fs_sb_info *sbi,
 		int type)
 {
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
 	return curseg->alloc_type;
 }
+
+#ifdef CONFIG_F2FS_MULTI_LOG
+static inline unsigned short curseg_blkoff_at(struct f2fs_sb_info *sbi, int type,
+        int log)
+{
+	struct curseg_info *curseg = CURSEG_I(sbi, log * NR_CURSEG_TYPE + type);
+	return curseg->next_blkoff;
+}
+#endif
 
 static inline unsigned short curseg_blkoff(struct f2fs_sb_info *sbi, int type)
 {

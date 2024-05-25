@@ -29,6 +29,10 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 	struct f2fs_stat_info *si = F2FS_STAT(sbi);
 	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
 	int i;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int j;
+	struct curseg_info *curseg;
+#endif
 
 	/* these will be changed if online resize is done */
 	si->main_area_segs = le32_to_cpu(raw_super->segment_count_main);
@@ -128,12 +132,67 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 		* 100 / (int)(sbi->user_block_count >> sbi->log_blocks_per_seg)
 		/ 2;
 	si->util_invalid = 50 - si->util_free - si->util_valid;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	si->nr_max_logs = sbi->nr_max_logs;
+	si->nr_active_logs = __get_number_active_logs(sbi);
+	for(i = 0; i < sbi->nr_max_logs; i++){
+		for (j = CURSEG_HOT_DATA; j <= CURSEG_COLD_NODE; j++) {
+			curseg = CURSEG_I(sbi, i * NR_CURSEG_TYPE + j);
+			si->curseg[i * NR_CURSEG_TYPE + j] = curseg->segno;
+			si->cursec[i * NR_CURSEG_TYPE + j] = GET_SEC_FROM_SEG(sbi, curseg->segno);
+			si->curzone[i * NR_CURSEG_TYPE + j] = GET_ZONE_FROM_SEC(sbi, si->cursec[i * NR_CURSEG_TYPE + j]);
+		}
+	}
+
+	for (i = 0; i < NO_CHECK_TYPE * MAX_ACTIVE_LOGS; i++) {
+        si->dirty_seg[i] = 0;
+        si->full_seg[i] = 0;
+        si->valid_blks[i] = 0;
+    }
+
+    for (i = 0; i < MAIN_SEGS(sbi); i++) {
+        int blks = get_seg_entry(sbi, i)->valid_blocks;
+        int type = get_seg_entry(sbi, i)->type;
+		int log = get_seg_entry(sbi, i)->log;
+
+        if (!blks)
+            continue;
+
+        if (blks == sbi->blocks_per_seg)
+            si->full_seg[log * NR_CURSEG_TYPE + type]++;
+        else
+            si->dirty_seg[log * NR_CURSEG_TYPE + type]++;
+        si->valid_blks[log * NR_CURSEG_TYPE + type] += blks;
+    }
+#else
 	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_NODE; i++) {
 		struct curseg_info *curseg = CURSEG_I(sbi, i);
 		si->curseg[i] = curseg->segno;
 		si->cursec[i] = GET_SEC_FROM_SEG(sbi, curseg->segno);
 		si->curzone[i] = GET_ZONE_FROM_SEC(sbi, si->cursec[i]);
 	}
+
+	for (i = 0; i < NO_CHECK_TYPE; i++) {
+        si->dirty_seg[i] = 0;
+        si->full_seg[i] = 0;
+        si->valid_blks[i] = 0;
+    }
+
+    for (i = 0; i < MAIN_SEGS(sbi); i++) {
+        int blks = get_seg_entry(sbi, i)->valid_blocks;
+        int type = get_seg_entry(sbi, i)->type;
+
+        if (!blks)
+            continue;
+
+        if (blks == sbi->blocks_per_seg)
+            si->full_seg[type]++;
+        else
+            si->dirty_seg[type]++;
+        si->valid_blks[type] += blks;
+    }
+
+#endif
 
 	for (i = META_CP; i < META_MAX; i++)
 		si->meta_count[i] = atomic_read(&sbi->meta_count[i]);
@@ -218,8 +277,13 @@ static void update_mem_info(struct f2fs_sb_info *sbi)
 	si->base_mem += f2fs_bitmap_size(MAIN_SECS(sbi));
 
 	/* build curseg */
+#ifdef CONFIG_F2FS_MULTI_LOG
+	si->base_mem += sizeof(struct curseg_info) * NR_CURSEG_TYPE * MAX_ACTIVE_LOGS;
+	si->base_mem += PAGE_SIZE * NR_CURSEG_TYPE * MAX_ACTIVE_LOGS;
+#else
 	si->base_mem += sizeof(struct curseg_info) * NR_CURSEG_TYPE;
 	si->base_mem += PAGE_SIZE * NR_CURSEG_TYPE;
+#endif
 
 	/* build dirty segmap */
 	si->base_mem += sizeof(struct dirty_seglist_info);
@@ -283,6 +347,9 @@ static int stat_show(struct seq_file *s, void *v)
 	struct f2fs_stat_info *si;
 	int i = 0;
 	int j;
+#ifdef CONFIG_F2FS_MULTI_LOG
+	int logs;
+#endif
 
 	mutex_lock(&f2fs_stat_mutex);
 	list_for_each_entry(si, &f2fs_stat_list, stat_list) {
@@ -322,30 +389,255 @@ static int stat_show(struct seq_file *s, void *v)
 		seq_printf(s, "\nMain area: %d segs, %d secs %d zones\n",
 			   si->main_area_segs, si->main_area_sections,
 			   si->main_area_zones);
-		seq_printf(s, "  - COLD  data: %d, %d, %d\n",
+#ifdef CONFIG_F2FS_MULTI_LOG
+		seq_printf(s, "\n    Multi-Log INFO:\n");
+        seq_printf(s, "  - Log Allocation:\n");
+        if (F2FS_OPTION(si->sbi).log_alloc_policy == LOG_ALLOC_SPF)
+            seq_printf(s, "         Policy: %3s\n", "SPF");
+        else if (F2FS_OPTION(si->sbi).log_alloc_policy == LOG_ALLOC_SRR)
+            seq_printf(s, "         Policy: %3s\n", "SRR");
+        else
+            seq_printf(s, "         Policy: %4s\n", "AMFS");
+        seq_printf(s, "  - Maximum Logs: %u\n", 
+                si->nr_max_logs);
+        seq_printf(s, "  - Active Logs: %u\n",
+                si->nr_active_logs);
+        seq_printf(s, "  - LOGS:\n        Maximum:  [ %2u %2u %2u %2u %2u %2u  ]\n",
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_HOT_DATA],
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_WARM_DATA],
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_COLD_DATA],
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_HOT_NODE],
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_WARM_NODE],
+                F2FS_OPTION(si->sbi).nr_logs[CURSEG_COLD_NODE]);
+        seq_printf(s, "         Active:  [ %2u %2u %2u %2u %2u %2u  ]\n",
+                __get_number_active_logs_for_type(si->sbi, CURSEG_HOT_DATA),
+                __get_number_active_logs_for_type(si->sbi, CURSEG_WARM_DATA),
+                __get_number_active_logs_for_type(si->sbi, CURSEG_COLD_DATA),
+                __get_number_active_logs_for_type(si->sbi, CURSEG_HOT_NODE),
+                __get_number_active_logs_for_type(si->sbi, CURSEG_WARM_NODE),
+                __get_number_active_logs_for_type(si->sbi, CURSEG_COLD_NODE));
+        if (F2FS_OPTION(si->sbi).log_alloc_policy == LOG_ALLOC_SPF) {
+            seq_printf(s, "      EXCLUSIVE:  [ %2u %2u %2u %2u %2u %2u  ]\n",
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_HOT_DATA),
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_WARM_DATA),
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_COLD_DATA),
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_HOT_NODE),
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_WARM_NODE),
+                    __get_number_reserved_logs_for_type(si->sbi, CURSEG_COLD_NODE));
+        }
+        seq_printf(s, "  - ACTIVE LOG BITMAPS:\n");
+        for (i = 0; i < NR_CURSEG_TYPE; i++) {
+            switch (i) {
+                case 0:
+                    seq_printf(s, "       %s   [ ", "HOT_DATA");
+                    break;
+                case 1:
+                    seq_printf(s, "       %s  [ ", "WARM_DATA");
+                    break;
+                case 2:
+                    seq_printf(s, "       %s  [ ", "COLD_DATA");
+                    break;
+                case 3:
+                    seq_printf(s, "       %s   [ ", "HOT_NODE");
+                    break;
+                case 4:
+                    seq_printf(s, "       %s  [ ", "WARM_NODE");
+                    break;
+                case 5:
+                    seq_printf(s, "       %s  [ ", "COLD_NODE");
+                    break;
+            }
+            for (j = 0; j < si->sbi->nr_max_logs - CURSEG_COLD_NODE; j++) {
+                if(__test_inuse_log(si->sbi, i, j))
+                    seq_printf(s, "1 ");
+                else
+                    seq_printf(s, "0 ");
+            }
+            seq_printf(s, "]\n");
+        }
+        if (F2FS_OPTION(si->sbi).log_alloc_policy == LOG_ALLOC_SPF) {
+            seq_printf(s, "  - EXCLUSIVE LOG BITMAPS:\n");
+            for (i = 0; i < NR_CURSEG_TYPE; i++) {
+                switch (i) {
+                    case 0:
+                        seq_printf(s, "       %s   [ ", "HOT_DATA");
+                        break;
+                    case 1:
+                        seq_printf(s, "       %s  [ ", "WARM_DATA");
+                        break;
+                    case 2:
+                        seq_printf(s, "       %s  [ ", "COLD_DATA");
+                        break;
+                    case 3:
+                        seq_printf(s, "       %s   [ ", "HOT_NODE");
+                        break;
+                    case 4:
+                        seq_printf(s, "       %s  [ ", "WARM_NODE");
+                        break;
+                    case 5:
+                        seq_printf(s, "       %s  [ ", "COLD_NODE");
+                        break;
+                }
+                logs = __get_number_active_logs_for_type(si->sbi, i);
+                for (j = 0; j < logs; j++) {
+                    if (j == 0)
+                        seq_printf(s, "- ");
+                    else if (__test_log_reserved(si->sbi, i, j))
+                        seq_printf(s, "1 ");
+                    else
+                        seq_printf(s, "0 ");
+                }
+                seq_printf(s, "]\n");
+            }
+            seq_printf(s, "  - EXCLUSIVE LOG INO-MAP:\n");
+            for (i = 0; i < NR_CURSEG_TYPE; i++) {
+                switch (i) {
+                    case 0:
+                        seq_printf(s, "       %s   [ ", "HOT_DATA");
+                        break;
+                    case 1:
+                        seq_printf(s, "       %s  [ ", "WARM_DATA");
+                        break;
+                    case 2:
+                        seq_printf(s, "       %s  [ ", "COLD_DATA");
+                        break;
+                    case 3:
+                        seq_printf(s, "       %s   [ ", "HOT_NODE");
+                        break;
+                    case 4:
+                        seq_printf(s, "       %s  [ ", "WARM_NODE");
+                        break;
+                    case 5:
+                        seq_printf(s, "       %s  [ ", "COLD_NODE");
+                        break;
+                }
+                logs = __get_number_active_logs_for_type(si->sbi, i);
+                for (j = 0; j < logs; j++) {
+                    if (j == 0)
+                        seq_printf(s, "- ");
+                    else if (__test_log_reserved(si->sbi, i, j))
+                        seq_printf(s, "%lu ", __get_reserved_log_inode(si->sbi, i, j));
+                    else
+                        seq_printf(s, "0 ");
+
+                }
+                seq_printf(s, "]\n");
+            }
+        }
+		seq_printf(s, "\n    TYPE     %8s %8s %8s %8s %10s %10s %10s\n",
+			   "LOG", "segno", "secno", "zoneno", "dirty_seg", "full_seg", "valid_blk");
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_HOT_DATA);
+        for (i = 0; i < logs; i++)
+        {
+            seq_printf(s, "  - HOT  data:   %4d %8d %8d %8d %10u %10u %10u\n",
+                    i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA],
+                    si->cursec[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA],
+                    si->curzone[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA],
+                    si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA],
+                    si->full_seg[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA],
+                    si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_HOT_DATA]);
+        }
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_WARM_DATA);
+        for (i = 0; i < logs; i++)
+        {
+		seq_printf(s, "  - WARM data:   %4d %8d %8d %8d %10u %10u %10u\n",
+			   i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA],
+			   si->cursec[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA],
+			   si->curzone[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA],
+			   si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA],
+			   si->full_seg[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA],
+			   si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_WARM_DATA]);
+        }
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_COLD_DATA);
+        for (i = 0; i < logs; i++)
+        {
+            seq_printf(s, "  - COLD data:   %4d %8d %8d %8d %10u %10u %10u\n",
+                    i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA],
+                    si->cursec[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA],
+                    si->curzone[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA],
+                    si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA],
+                    si->full_seg[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA],
+                    si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_COLD_DATA]);
+        }
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_HOT_NODE);
+        for (i = 0; i < logs; i++)
+        {
+            seq_printf(s, "  - HOT  node:   %4d %8d %8d %8d %10u %10u %10u\n",
+                    i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE],
+                    si->cursec[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE],
+                    si->curzone[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE],
+                    si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE],
+                    si->full_seg[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE],
+                    si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_HOT_NODE]);
+        }
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_WARM_NODE);
+        for (i = 0; i < logs; i++)
+        {
+		seq_printf(s, "  - WARM node:   %4d %8d %8d %8d %10u %10u %10u\n",
+			   i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE],
+			   si->cursec[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE],
+			   si->curzone[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE],
+			   si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE],
+			   si->full_seg[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE],
+			   si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_WARM_NODE]);
+        }
+        logs = __get_number_active_logs_for_type(si->sbi, CURSEG_COLD_NODE);
+        for (i = 0; i < logs; i++)
+        {
+            seq_printf(s, "  - COLD node:   %4d %8d %8d %8d %10u %10u %10u\n",
+                    i, si->curseg[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE],
+                    si->cursec[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE],
+                    si->curzone[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE],
+                    si->dirty_seg[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE],
+                    si->full_seg[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE],
+                    si->valid_blks[i * NR_CURSEG_TYPE + CURSEG_COLD_NODE]);
+        }
+#else
+		seq_printf(s, "    TYPE         %8s %8s %8s %10s %10s %10s\n",
+			   "segno", "secno", "zoneno", "dirty_seg", "full_seg", "valid_blk");
+		seq_printf(s, "  - COLD   data: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_COLD_DATA],
 			   si->cursec[CURSEG_COLD_DATA],
-			   si->curzone[CURSEG_COLD_DATA]);
-		seq_printf(s, "  - WARM  data: %d, %d, %d\n",
+			   si->curzone[CURSEG_COLD_DATA],
+			   si->dirty_seg[CURSEG_COLD_DATA],
+			   si->full_seg[CURSEG_COLD_DATA],
+			   si->valid_blks[CURSEG_COLD_DATA]);
+		seq_printf(s, "  - WARM   data: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_WARM_DATA],
 			   si->cursec[CURSEG_WARM_DATA],
-			   si->curzone[CURSEG_WARM_DATA]);
-		seq_printf(s, "  - HOT   data: %d, %d, %d\n",
+			   si->curzone[CURSEG_WARM_DATA],
+			   si->dirty_seg[CURSEG_WARM_DATA],
+			   si->full_seg[CURSEG_WARM_DATA],
+			   si->valid_blks[CURSEG_WARM_DATA]);
+		seq_printf(s, "  - HOT    data: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_HOT_DATA],
 			   si->cursec[CURSEG_HOT_DATA],
-			   si->curzone[CURSEG_HOT_DATA]);
-		seq_printf(s, "  - Dir   dnode: %d, %d, %d\n",
+			   si->curzone[CURSEG_HOT_DATA],
+			   si->dirty_seg[CURSEG_HOT_DATA],
+			   si->full_seg[CURSEG_HOT_DATA],
+			   si->valid_blks[CURSEG_HOT_DATA]);
+		seq_printf(s, "  - Dir   dnode: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_HOT_NODE],
 			   si->cursec[CURSEG_HOT_NODE],
-			   si->curzone[CURSEG_HOT_NODE]);
-		seq_printf(s, "  - File   dnode: %d, %d, %d\n",
+			   si->curzone[CURSEG_HOT_NODE],
+			   si->dirty_seg[CURSEG_HOT_NODE],
+			   si->full_seg[CURSEG_HOT_NODE],
+			   si->valid_blks[CURSEG_HOT_NODE]);
+		seq_printf(s, "  - File  dnode: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_WARM_NODE],
 			   si->cursec[CURSEG_WARM_NODE],
-			   si->curzone[CURSEG_WARM_NODE]);
-		seq_printf(s, "  - Indir nodes: %d, %d, %d\n",
+			   si->curzone[CURSEG_WARM_NODE],
+			   si->dirty_seg[CURSEG_WARM_NODE],
+			   si->full_seg[CURSEG_WARM_NODE],
+			   si->valid_blks[CURSEG_WARM_NODE]);
+		seq_printf(s, "  - Indir nodes: %8d %8d %8d %10u %10u %10u\n",
 			   si->curseg[CURSEG_COLD_NODE],
 			   si->cursec[CURSEG_COLD_NODE],
-			   si->curzone[CURSEG_COLD_NODE]);
+			   si->curzone[CURSEG_COLD_NODE],
+			   si->dirty_seg[CURSEG_COLD_NODE],
+			   si->full_seg[CURSEG_COLD_NODE],
+			   si->valid_blks[CURSEG_COLD_NODE]);
+#endif
 		seq_printf(s, "\n  - Valid: %d\n  - Dirty: %d\n",
 			   si->main_area_segs - si->dirty_count -
 			   si->prefree_count - si->free_segs,

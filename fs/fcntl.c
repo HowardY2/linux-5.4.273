@@ -319,6 +319,57 @@ static long fcntl_rw_hint(struct file *file, unsigned int cmd,
 	}
 }
 
+static bool logmap_valid(unsigned long logmap)
+{
+    /* maximum of 11 streams for a single type, since there can be
+     * 16 active streams and we need at least one stream per type */
+    return !bitmap_empty(&logmap, 11);
+}
+
+static long fcntl_data_logmap(struct file *file, unsigned int cmd,
+			  unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	u64 __user *argp = (u64 __user *)arg;
+    unsigned long logmap;
+
+	switch (cmd) {
+    case F_SET_DATA_LOG_MAP:
+		if (copy_from_user(&logmap, argp, sizeof(unsigned long)))
+			return -EFAULT;
+		if (!logmap_valid(logmap))
+			return -EINVAL;
+
+		inode_lock(inode);
+		inode->i_logmap = logmap;
+        inode->i_has_logmap = true;
+		inode_unlock(inode);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static long fcntl_set_data_log(struct file *file, unsigned int cmd)
+{
+	struct inode *inode = file_inode(file);
+
+	switch (cmd) {
+	case F_SET_EXCLUSIVE_DATA_LOG:
+		inode_lock(inode);
+		inode->i_exclusive_data_log = true;
+		inode_unlock(inode);
+		return 0;
+    case F_UNSET_EXCLUSIVE_DATA_LOG:
+		inode_lock(inode);
+		inode->i_exclusive_data_log = false;
+		inode_unlock(inode);
+        return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
 		struct file *filp)
 {
@@ -426,6 +477,13 @@ static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
 	case F_SET_FILE_RW_HINT:
 		err = fcntl_rw_hint(filp, cmd, arg);
 		break;
+	case F_SET_EXCLUSIVE_DATA_LOG:
+    case F_UNSET_EXCLUSIVE_DATA_LOG:
+        err = fcntl_set_data_log(filp, cmd);
+        break;
+    case F_SET_DATA_LOG_MAP:
+        err = fcntl_data_logmap(filp, cmd, arg);
+        break;
 	default:
 		break;
 	}
