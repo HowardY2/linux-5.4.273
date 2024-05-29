@@ -1606,7 +1606,7 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	seq_printf(seq, ",warm_node_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_WARM_NODE]);
 	seq_printf(seq, ",cold_node_logs=%u", F2FS_OPTION(sbi).nr_logs[CURSEG_COLD_NODE]);
     if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SRR)
-        seq_printf(seq, ",log_alloc=%s", "ssr");
+        seq_printf(seq, ",log_alloc=%s", "srr");
     else
         seq_printf(seq, ",log_alloc=%s", "spf");
 #endif

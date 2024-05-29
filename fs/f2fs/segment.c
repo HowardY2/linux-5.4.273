@@ -3417,6 +3417,8 @@ static unsigned int __get_log_spf_policy(struct f2fs_sb_info *sbi,
     unsigned int log = 0;
     enum page_type ptype = PAGE_TYPE_OF_TEMP_TYPE(type);
 
+	f2fs_info(sbi, "Got type in spf:  %u", type);
+
     spin_lock(&fi->i_logs_lock);
 
     if (ptype == DATA) {
@@ -3541,6 +3543,9 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	down_write(&sit_i->sentry_lock);
 
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
+	if (*new_blkaddr == NULL_ADDR) {
+        printk(KERN_ERR "f2fs: Failed to allocate new block address\n");
+    }
 
 	f2fs_wait_discard_bio(sbi, *new_blkaddr);
 
