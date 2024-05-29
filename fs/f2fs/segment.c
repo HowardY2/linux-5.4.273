@@ -3485,10 +3485,18 @@ static unsigned int f2fs_get_curseg_log(struct f2fs_sb_info *sbi,
 {
     if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SRR)
         return __get_log_rr_policy(sbi, type);
-    else if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SPF)
-        return __get_log_spf_policy(sbi, type, fio);
-    else
-        return __get_log_amfs_policy(sbi, type, fio);
+    else if (F2FS_OPTION(sbi).log_alloc_policy == LOG_ALLOC_SPF){
+		if(!fio)
+			return 0;
+		else
+			return __get_log_spf_policy(sbi, type, fio);
+	}
+    else {
+		if(!fio)
+			return 0;
+		else 
+			return __get_log_amfs_policy(sbi, type, fio);
+	}
 }
 #endif
 
